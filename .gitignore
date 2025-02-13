@@ -1,0 +1,63 @@
+.DS_Store
+
+# Python pycache:
+__pycache__/
+.ipynb_checkpoints/
+
+#Python virtual environment
+venv/
+env/
+conda-env/
+
+#python compiled files
+*.pyc
+
+#sandbox files
+sandbox/
+
+#Google App Engine Standard
+lib/
+
+#windows generated files
+Thumbs.db
+
+#Binary files
+*.obj
+*.exe
+*.pdb
+*.user
+*.aps
+*.pch
+*.vspscc
+*_i.c
+*_p.c
+*.ncb
+*.suo
+*.tlb
+*.tlh
+*.bak
+*.cache
+*.ilk
+*.log
+*.dll
+*.lib
+*.sbr
+*.un~
+*.gz
+
+#Pycharm
+
+*.ndb
+.idea
+# node
+node_modules/
+
+# credential files
+credentials/
+
+# VScode
+.vscode
+
+opt/
+backtests/
+

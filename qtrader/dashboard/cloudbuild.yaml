@@ -1,0 +1,10 @@
+steps:
+- name: "gcr.io/cloud-builders/docker"
+  args:
+  - build
+  - "--tag=gcr.io/as-dev-anze/qtrader-dashboard"
+  - "--file=./qtrader/dashboard/Dockerfile"
+  - .
+
+images:
+- "gcr.io/as-dev-anze/qtrader-dashboard"

@@ -1,0 +1,354 @@
+# region Set random seeds
+seed_value = 42
+# 1. Set the `PYTHONHASHSEED` environment variable at a fixed value
+import os
+
+os.environ["PYTHONHASHSEED"] = str(seed_value)
+
+# 2. Set the `python` built-in pseudo-random generator at a fixed value
+import random
+
+random.seed(seed_value)
+
+# 3. Set the `numpy` pseudo-random generator at a fixed value
+import numpy as np
+
+np.random.seed(seed_value)
+
+# 4. Set the `tensorflow` pseudo-random generator at a fixed value
+import tensorflow as tf
+
+tf.random.set_seed(seed_value)
+# endregion
+
+# region Imports
+from AlgorithmImports import *
+
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+from qtrader.rlflow.persistence import (
+    BasePersistenceProvider,
+    NoPersistenceProvider,
+    LeanSQLitePersistenceProvider,
+)
+from qtrader.environments.base import BaseMarketEnv
+from qtrader.environments.lean import LeanMarketEnv
+from qtrader.agents.base import RandomAgent
+from qtrader.agents.dq import DQAgent
+
+from qtrader.rlflow.state import StateProviderTask, StateAggregatorTask
+from qtrader.rlflow.action import ActTask, ShapeActionsForMappingTask, ExecuteActionTask
+from qtrader.rlflow.feedback import FeedbackTask
+
+from qtrader.stateproviders.basic import (
+    AccountInfoStateProvider,
+    PositionSymbolStateProvider,
+    TradeSymbolStateProvider,
+    OHLCVSymbolStateProvider,
+)
+from qtrader.stateproviders.indicators import (
+    BridgeBandsSymbolStateProvider,
+    MACDSymbolStateProvider,
+)
+
+# endregion
+
+
+class QTraderAlgorithm(QCAlgorithm):
+
+    def _load_run_params(self):
+        params = {}
+        try:
+            params_path = self.object_store.get_file_path(f"{self.name}/params.json")
+            with open(params_path, "rb") as f:
+                params = json.load(f)
+
+        except:
+            pass
+        finally:
+            return params
+
+    def _create_agent(self, name, pprovider, params):
+        model_n_layers = int(params.get("model_n_layers", 2))
+        model_fl_size = int(params.get("model_fl_size", 128))
+        model_shape = params.get("model_shape", "flat")
+
+        agent = DQAgent(
+            name=name,
+            pprovider=pprovider,
+            expl_max=1,
+            expl_min=float(params.get("expl_min", 0.01)),
+            expl_decay=float(params.get("expl_decay", 0.9995)),
+            invest_pct=0.05,
+            invest_max=0.12,  # how much to invest in an order
+            n_steps_warmup=int(params.get("n_steps_warmup", 1024)),
+            n_step_update=int(params.get("n_step_update", 4)),
+            n_steps_target_update=int(params.get("n_steps_target_update", 5000)),
+            exp_memory_size=int(params.get("exp_memory_size", 365 * 100_000)),
+            exp_mini_batch_size=int(params.get("exp_mini_batch_size", 32)),
+            exp_weighting=float(params.get("exp_weighting", 0.4)),
+            exp_w_inc=float(params.get("exp_w_inc", 0.00005)),
+            exp_alpha=float(params.get("exp_alpha", 0.8)),
+            model_lr=float(params.get("model_lr", 1e-4)),
+            model_l2_reg=float(params.get("model_l2_reg", 0)),
+            model_layers=[
+                (
+                    int(model_fl_size / np.power(2, i))
+                    if model_shape == "cone"
+                    else model_fl_size
+                )
+                for i in range(model_n_layers)
+            ],  # model related
+            rl_gamma=float(params.get("rl_gamma", 0.9)),
+            rl_reward_type=params.get("rl_reward_type", "position-relative-log"),
+            rl_nudge_reward_pct=params.get("rl_nudge_reward_pct", 0.0),
+        )
+
+        return agent
+
+    def initialize(self):
+        run_params = self._load_run_params()
+        base_name = self.name.split("/")[0]
+        self.debug(run_params)
+
+        run_type = "LIVE" if self.live_mode else run_params.get("run_type", "TRAIN")
+        date_start = datetime.fromisoformat(run_params.get("date_start", "2018-01-01"))
+        date_end = datetime.fromisoformat(run_params.get("date_end", "2019-01-01"))
+
+        self.set_start_date(date_start.year, date_start.month, date_start.day)
+        self.set_end_date(date_end.year, date_end.month, date_end.day)
+
+        self.set_account_currency("USD")
+        self.set_cash(1000)  # Set Strategy Cash
+
+        self.set_brokerage_model(BrokerageName.COINBASE, AccountType.CASH)
+        self.set_trade_builder(
+            TradeBuilder(FillGroupingMethod.FLAT_TO_FLAT, FillMatchingMethod.FIFO)
+        )
+
+        self.exchange = self.add_crypto("BTCUSD", Resolution.DAILY)
+        self.symbol = self.exchange.symbol
+        self.set_time_zone(self.exchange.exchange.time_zone)
+
+        # persistance
+        self.pprovider = LeanSQLitePersistenceProvider(
+            prefix=base_name, lean_obj_store=self.object_store
+        )
+        assert isinstance(self.pprovider, BasePersistenceProvider)
+
+        # market env
+        self.menv = LeanMarketEnv(qcl=self, pprovider=self.pprovider)
+        assert isinstance(self.menv, BaseMarketEnv)
+
+        # region Agent
+
+        # agent = RandomAgent()
+        agent = self._create_agent(
+            base_name, self.pprovider, run_params.get("hyperparams", {})
+        )
+        assert isinstance(agent, DQAgent)
+        agent.no_learn = True if run_type in ("EVAL", "LIVE") else False
+        agent.no_full_state = False if run_type == "LIVE" else True
+        agent.load_config()
+        self.agent = agent
+
+        # endregion
+
+        # region State providers
+
+        self.task_sp_acc_info = StateProviderTask(
+            self.menv, self.pprovider, AccountInfoStateProvider, name="AccountInfo"
+        )
+        self.task_ssp_position = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            PositionSymbolStateProvider,
+            name="PositionSymbol",
+        )
+        self.task_ssp_trade = StateProviderTask(
+            self.menv, self.pprovider, TradeSymbolStateProvider, name="TradeSymbol"
+        )
+        self.task_ssp_ohlcv = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            OHLCVSymbolStateProvider,
+            params={"days_ago": 365},
+            name="OHLCVSymbol",
+            allow_cache=True,
+        )
+
+        self.task_ssp_bb = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            BridgeBandsSymbolStateProvider,
+            params={"days_ago": 365},
+            name="BridgeBandsSymbol",
+            allow_cache=True,
+        )
+
+        self.task_ssp_macd_sht = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            MACDSymbolStateProvider,
+            params={
+                "days_ago": 365,
+                "ema_short_length": 12,
+                "ema_long_length": 26,
+                "signal_length": 9,
+            },
+            name="MACDSymbolShort",
+            allow_cache=True,
+        )
+
+        self.task_ssp_macd_lng = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            MACDSymbolStateProvider,
+            params={
+                "days_ago": 365 * 3,
+                "ema_short_length": 50,
+                "ema_long_length": 200,
+                "signal_length": 35,
+            },
+            name="MACDSymbolLong",
+            allow_cache=True,
+        )
+
+        self.task_state_agg = StateAggregatorTask(self.menv, self.pprovider)
+
+        # endregion
+
+        # region Action
+
+        self.task_act = ActTask(self.menv, self.pprovider, agent=agent)
+        self.task_shape_actions = ShapeActionsForMappingTask(self.menv, self.pprovider)
+        self.task_action_exec = ExecuteActionTask(self.menv, self.pprovider)
+
+        # endregion
+
+        # region Feedback
+
+        self.task_feedback = FeedbackTask(self.menv, self.pprovider, agent=agent)
+
+        # endregion
+
+        self.p_symbols = [self.symbol.value]
+        self.p_state_prev = None
+        self.p_cache_enabled = True
+
+    def on_data(self, data: Slice):
+        """on_data event is the primary entry point for your algorithm. Each new data point will be pumped in here.
+        Arguments:
+            data: Slice object keyed by symbol containing the stock data
+        """
+        cur_date = self.menv.get_current_market_datetime()
+        self.menv.log(f"DAY: {cur_date}")
+        if cur_date + timedelta(days=1) >= self.end_date:  # last day, close all
+            for sy in self.p_symbols:
+                self.menv.execute_close_position(sy)
+
+            return
+
+        # region Create state
+
+        rslt_task_sp_acc_info = self.task_sp_acc_info.run(
+            cache_enabled=self.p_cache_enabled
+        )
+
+        rslt_task_ssp_position = [
+            self.task_ssp_position.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_trade = [
+            self.task_ssp_trade.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_ohlcv = [
+            self.task_ssp_ohlcv.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_bb = [
+            self.task_ssp_bb.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_macd_sht = [
+            self.task_ssp_macd_sht.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_macd_lng = [
+            self.task_ssp_macd_lng.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+
+        state = self.task_state_agg.run(
+            symbols=self.p_symbols,
+            states_global=[rslt_task_sp_acc_info],
+            states_symbol=[
+                rslt_task_ssp_position,
+                rslt_task_ssp_trade,
+                rslt_task_ssp_ohlcv,
+                rslt_task_ssp_bb,
+                rslt_task_ssp_macd_sht,
+                rslt_task_ssp_macd_lng,
+            ],
+        )
+
+        # endregion
+
+        # region Create action
+
+        actions, state = self.task_act.run(state)
+        self.menv.log(
+            "\n".join(
+                [
+                    f"{s}: {[round(p, 2) for p in v['predictions'].tolist()]}"
+                    for s, v in actions.items()
+                    if "predictions" in v
+                ]
+            )
+        )
+        for a in self.task_shape_actions.run(actions):
+            self.task_action_exec.run(a)
+
+        # endregion
+
+        self.task_feedback.run(self.p_state_prev, state)
+        self.menv.log(
+            f"\tMODEL STATS: N_STEP: {self.agent.n_steps} / N_UPDATES: {self.agent.n_updates} / N_UPDATES_TARGET: {self.agent.n_updates_target}"
+        )
+        self.menv.log(
+            f"\tMODEL STATS: EXPL_RATE: {self.agent.expl_rate} / EXP_W: {self.agent.exp_weighting}"
+        )
+
+        if self.agent.ready_to_learn(state):
+            self.agent.learn()
+            self.menv.log(f"\t{self.agent.learn_timer}")
+
+        self.p_state_prev = state
+
+    def on_order_event(self, order_event):
+        self.debug("{} {}".format(self.time, order_event.to_string()))
+
+    def on_end_of_algorithm(self):
+        if not self.agent.no_learn:
+            self.agent.save_config()
+            self.agent.save_model(online=True)
+
+        if hasattr(self.agent, "td_tracker_n") and self.agent.td_tracker_n > 0:
+            self.set_summary_statistic(
+                "mean_td_error",
+                self.agent.td_tracker / self.agent.td_tracker_n,
+            )
+
+        self.set_summary_statistic(
+            "mean_reward",
+            self.task_feedback.ttl_reward / self.task_feedback.num_feedbacks,
+        )
+
+        self.log(
+            "{} - TotalPortfolioValue: {}".format(
+                self.time, self.portfolio.total_portfolio_value
+            )
+        )
+        self.log("{} - CashBook: {}".format(self.time, self.portfolio.cash_book))

@@ -1,0 +1,3 @@
+lean==1.*
+optuna==4.*
+tensorflow==2.*
