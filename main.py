@@ -31,14 +31,17 @@ from qtrader.rlflow.persistence import (
     BasePersistenceProvider,
     NoPersistenceProvider,
     LeanSQLitePersistenceProvider,
+    LeanCachedSQLitePersistenceProvider,
 )
 from qtrader.environments.base import BaseMarketEnv
 from qtrader.environments.lean import LeanMarketEnv
 from qtrader.agents.base import RandomAgent
-from qtrader.agents.dq import DQAgent
+
+# from qtrader.agents.dq import DQAgent
+from qtrader.agents.dqtp import DQTPAgent
 
 from qtrader.rlflow.state import StateProviderTask, StateAggregatorTask
-from qtrader.rlflow.action import ActTask, ShapeActionsForMappingTask, ExecuteActionTask
+from qtrader.rlflow.action import ActTask
 from qtrader.rlflow.feedback import FeedbackTask
 
 from qtrader.stateproviders.basic import (
@@ -74,14 +77,13 @@ class QTraderAlgorithm(QCAlgorithm):
         model_fl_size = int(params.get("model_fl_size", 128))
         model_shape = params.get("model_shape", "flat")
 
-        agent = DQAgent(
+        agent = DQTPAgent(
             name=name,
             pprovider=pprovider,
             expl_max=1,
             expl_min=float(params.get("expl_min", 0.01)),
             expl_decay=float(params.get("expl_decay", 0.9995)),
             invest_pct=0.05,
-            invest_max=0.12,  # how much to invest in an order
             n_steps_warmup=int(params.get("n_steps_warmup", 1024)),
             n_step_update=int(params.get("n_step_update", 4)),
             n_steps_target_update=int(params.get("n_steps_target_update", 5000)),
@@ -101,8 +103,6 @@ class QTraderAlgorithm(QCAlgorithm):
                 for i in range(model_n_layers)
             ],  # model related
             rl_gamma=float(params.get("rl_gamma", 0.9)),
-            rl_reward_type=params.get("rl_reward_type", "position-relative-log"),
-            rl_nudge_reward_pct=params.get("rl_nudge_reward_pct", 0.0),
         )
 
         return agent
@@ -132,8 +132,9 @@ class QTraderAlgorithm(QCAlgorithm):
         self.set_time_zone(self.exchange.exchange.time_zone)
 
         # persistance
-        self.pprovider = LeanSQLitePersistenceProvider(
-            prefix=base_name, lean_obj_store=self.object_store
+        self.pprovider = LeanCachedSQLitePersistenceProvider(
+            prefix=base_name, lean_obj_store=self.object_store, 
+            cache_size=1024, flush_interval=256
         )
         assert isinstance(self.pprovider, BasePersistenceProvider)
 
@@ -147,7 +148,7 @@ class QTraderAlgorithm(QCAlgorithm):
         agent = self._create_agent(
             base_name, self.pprovider, run_params.get("hyperparams", {})
         )
-        assert isinstance(agent, DQAgent)
+        assert isinstance(agent, DQTPAgent)
         agent.no_learn = True if run_type in ("EVAL", "LIVE") else False
         agent.no_full_state = False if run_type == "LIVE" else True
         agent.load_config()
@@ -222,8 +223,6 @@ class QTraderAlgorithm(QCAlgorithm):
         # region Action
 
         self.task_act = ActTask(self.menv, self.pprovider, agent=agent)
-        self.task_shape_actions = ShapeActionsForMappingTask(self.menv, self.pprovider)
-        self.task_action_exec = ExecuteActionTask(self.menv, self.pprovider)
 
         # endregion
 
@@ -308,8 +307,6 @@ class QTraderAlgorithm(QCAlgorithm):
                 ]
             )
         )
-        for a in self.task_shape_actions.run(actions):
-            self.task_action_exec.run(a)
 
         # endregion
 
@@ -334,6 +331,11 @@ class QTraderAlgorithm(QCAlgorithm):
         if not self.agent.no_learn:
             self.agent.save_config()
             self.agent.save_model(online=True)
+            self.agent.save_model(online=False)
+
+        # flush any buffered persistence writes
+        if hasattr(self.pprovider, 'flush'):
+            self.pprovider.flush()
 
         if hasattr(self.agent, "td_tracker_n") and self.agent.td_tracker_n > 0:
             self.set_summary_statistic(

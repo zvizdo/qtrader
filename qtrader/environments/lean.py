@@ -51,20 +51,9 @@ class LeanMarketEnv(BaseMarketEnv):
         self.qcl.limit_order(symbol, size, price, order_properties=op)
 
     def execute_sell_limit(self, symbol, size, price):
-        self.execute_buy_limit(self, symbol, -1 * size, price)
+        self.execute_buy_limit(symbol, -1 * size, price)
 
     def execute_close_position(self, symbol):
-        # s = self.qcl.securities[symbol]
-        # base_currency = s.base_currency
-
-        # # Avoid negative amount after liquidate
-        # quantity = min(s.holdings.quantity, base_currency.amount)
-
-        # # Round down to observe the lot size
-        # lot_size = s.symbol_properties.lot_size
-        # quantity = (round(quantity / lot_size) - 1) * lot_size
-
-        # self.qcl.market_order(symbol, -quantity)
         self.qcl.liquidate(symbol)
 
     def get_position(self, symbol):
@@ -96,8 +85,11 @@ class LeanMarketEnv(BaseMarketEnv):
         sy = self.qcl.portfolio[symbol].symbol
         trades = [t for t in self.qcl.trade_builder.closed_trades if t.symbol == sy]
         orders = self.qcl.transactions.get_orders(
-            lambda x: x.symbol == symbol and x.status == OrderStatus.FILLED
+            lambda x: x.symbol == sy and x.status == OrderStatus.FILLED
         )
+
+        # Bug fix: Sort orders by fill time to ensure chronological grouping
+        orders = sorted(orders, key=lambda x: x.last_fill_time)
 
         ti = 0
         to_list = []
@@ -105,22 +97,17 @@ class LeanMarketEnv(BaseMarketEnv):
         for o in orders:
             od = map_order(o)
 
-            if ti < len(trades):  # have closed trades
-                t = trades[ti]
-                if o.last_fill_time >= t.entry_time and o.last_fill_time <= t.exit_time:
-                    t_curr.append(od)
-
-                elif o.last_fill_time > t.exit_time:
+            # Advance past any closed trades whose exit is before this order's fill time
+            while ti < len(trades) and o.last_fill_time > trades[ti].exit_time:
+                if t_curr:
                     to_list.append(t_curr)
-                    t_curr = [od]
-                    ti += 1
+                t_curr = []
+                ti += 1
 
-            else:  # open trade
-                t_curr.append(od)
-
+            t_curr.append(od)
             od["profit"] = BaseMarketEnv.get_order_pnl(t_curr)
 
-        if len(t_curr):
+        if t_curr:
             to_list.append(t_curr)
 
         return [

@@ -203,51 +203,131 @@ class BaseMarketEnv(object):
     @staticmethod
     def get_order_pnl(trade: List[dict]) -> float:
         """
-        Function to extract pnl from the last order in the trade
-        trade is a dictionary of:
-        {
-            'price': orders[-1].executed.price,
-            'size': abs(orders[-1].executed.size),
-            'instruction': "BUY" / "SELL",
-        }
+        Calculates PnL for the last order using FIFO matching against opening orders.
         """
-        trade_direction = trade[0]["instruction"]
-        order_last = trade[-1]
-
-        if trade_direction == order_last["instruction"]:
-            return 0
-
-        trade_price_avg = []
-        order_last_size = order_last["size"]
-        trade_oppdirection_size = np.sum(
-            [o["size"] for o in trade[:-1] if o["instruction"] != trade_direction]
-        )
-        for order in [o for o in trade if o["instruction"] == trade_direction]:
-            if order["size"] - trade_oppdirection_size > 0:
-                size_to_take = min(
-                    order["size"] - trade_oppdirection_size, order_last_size
-                )
-                trade_price_avg.append((order["price"], size_to_take))
-                order_last_size -= size_to_take
-                trade_oppdirection_size = min(trade_oppdirection_size - size_to_take, 0)
-
-            else:
-                trade_oppdirection_size -= order["size"]
-
-            if order_last_size <= 1e-6:  # 0:
-                break
-
-        if len(trade_price_avg) == 0:
+        if not trade:
             return 0.0
 
-        trade_price_avg = np.array(trade_price_avg)
-        trade_price_avg = (
-            trade_price_avg[:, 0] * trade_price_avg[:, 1]
-        ).sum() / trade_price_avg[:, 1].sum()
-        size_direction = 1 if trade_direction == "BUY" else -1
+        order_last = trade[-1]
+        trade_direction = trade[0]["instruction"]
+
+        # If adding to position (Buy -> Buy), no realized PnL
+        if order_last["instruction"] == trade_direction:
+            return 0.0
+
+        # 1. Calculate the 'skip' volume (Total previous closed volume)
+        # This replaces the specific list comprehension you had
+        qty_to_skip = 0.0
+        for o in trade[:-1]:
+            if o["instruction"] != trade_direction:
+                qty_to_skip += o["size"]
+
+        qty_needed = order_last["size"]
+        total_cost = 0.0
+        total_filled = 0.0
+
+        # 2. Iterate only opening orders to find matches
+        for order in trade:
+            # Skip unrelated orders (previous closes or the current close)
+            if order["instruction"] != trade_direction:
+                continue
+
+            order_size = order["size"]
+
+            # FIFO Logic:
+            # If we still have 'skip' volume, consume this order's size first
+            if qty_to_skip >= order_size:
+                qty_to_skip -= order_size
+                continue  # This order was fully closed previously
+
+            # If we are here, we have exhausted previous closes (or partially exhausted this one)
+            # The available meat on this order is original size minus whatever we needed to skip
+            available_on_order = order_size - qty_to_skip
+            qty_to_skip = 0.0  # We have now paid our "skip debt"
+
+            # Take what we need, or whatever is left on this order
+            take = min(qty_needed, available_on_order)
+
+            total_cost += take * order["price"]
+            total_filled += take
+            qty_needed -= take
+
+            # Optimization: Stop iterating if we filled the order
+            if qty_needed <= 1e-9:
+                break
+
+        # 3. Calculate PnL
+        if total_filled == 0:
+            return 0.0
+
+        avg_entry_price = total_cost / total_filled
+
+        # Direction multiplier: 1 if Long (Sell - Buy), -1 if Short (Buy - Sell)
+        # Logic: (Exit - Entry) * Size * (1 if Buy else -1)
+        # Simplified: (Exit - Entry) * Size for Long
+        #             (Entry - Exit) * Size for Short
+
+        direction_mult = 1 if trade_direction == "BUY" else -1
+
+        # Note: We calculate PnL on the *order_last['size']*
+        # If we closed more than we opened (flip), this assumes the flipped portion
+        # shares the same entry price (or you might want to limit pnl to total_filled)
         pnl = (
-            size_direction
+            direction_mult
             * order_last["size"]
-            * (order_last["price"] - trade_price_avg)
+            * (order_last["price"] - avg_entry_price)
         )
+
         return pnl
+
+    # @staticmethod
+    # def get_order_pnl(trade: List[dict]) -> float:
+    #     """
+    #     Function to extract pnl from the last order in the trade
+    #     trade is a dictionary of:
+    #     {
+    #         'price': orders[-1].executed.price,
+    #         'size': abs(orders[-1].executed.size),
+    #         'instruction': "BUY" / "SELL",
+    #     }
+    #     """
+    #     trade_direction = trade[0]["instruction"]
+    #     order_last = trade[-1]
+
+    #     if trade_direction == order_last["instruction"]:
+    #         return 0
+
+    #     trade_price_avg = []
+    #     order_last_size = order_last["size"]
+    #     trade_oppdirection_size = np.sum(
+    #         [o["size"] for o in trade[:-1] if o["instruction"] != trade_direction]
+    #     )
+    #     for order in [o for o in trade if o["instruction"] == trade_direction]:
+    #         if order["size"] - trade_oppdirection_size > 0:
+    #             size_to_take = min(
+    #                 order["size"] - trade_oppdirection_size, order_last_size
+    #             )
+    #             trade_price_avg.append((order["price"], size_to_take))
+    #             order_last_size -= size_to_take
+    #             trade_oppdirection_size = min(trade_oppdirection_size - size_to_take, 0)
+
+    #         else:
+    #             trade_oppdirection_size -= order["size"]
+
+    #         if order_last_size <= 1e-6:  # 0:
+    #             break
+
+    #     if len(trade_price_avg) == 0:
+    #         return 0.0
+
+    #     trade_price_avg = np.array(trade_price_avg)
+    #     trade_price_avg = (
+    #         trade_price_avg[:, 0] * trade_price_avg[:, 1]
+    #     ).sum() / trade_price_avg[:, 1].sum()
+    #     size_direction = 1 if trade_direction == "BUY" else -1
+    #     pnl = (
+    #         size_direction
+    #         * order_last["size"]
+    #         * (order_last["price"] - trade_price_avg)
+    #     )
+    #     return pnl

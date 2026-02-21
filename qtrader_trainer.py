@@ -57,6 +57,8 @@ def run_backtest(
     dump_params(config_dir_f, run_params, run_name=run_name)
 
     output_path = iter_dir_f(run_name)
+    # Fix #9: log exceptions on each retry; raise if all attempts fail
+    last_exc = None
     for t in np.random.randint(0, 16, size=5):
         time.sleep(t)
         try:
@@ -68,10 +70,17 @@ def run_backtest(
                 detach=False,
                 no_update=True,
             )
+            last_exc = None
             break
 
         except Exception as e:
-            pass
+            print(f"BACKTEST RETRY FAILED [{run_name}]: {e}")
+            last_exc = e
+
+    if last_exc is not None:
+        raise RuntimeError(
+            f"All backtest attempts failed for '{run_name}'"
+        ) from last_exc
 
     id, s = get_run_stats(output_path)
 
@@ -199,9 +208,9 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
         tfb_record(tfb_writer, step=step, mode=run_params["run_type"], stats=stats)
         # endregion
 
-        # prune if enabled and required
+        # Fix #8: only raise TrialPruned when running inside Optuna (prune is not None)
         num_orders = lambda s: len(s["orders"].keys())
-        if step >= 50 and num_orders(stats) <= 15:
+        if prune is not None and step >= 50 and num_orders(stats) <= 15:
             raise optuna.TrialPruned()
 
         if prune is not None and callable(prune):

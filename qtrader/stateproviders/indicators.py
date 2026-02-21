@@ -1,6 +1,5 @@
 from itertools import combinations
 
-import copy
 import numpy as np
 import pandas as pd
 import ta
@@ -82,12 +81,15 @@ class TrendlinesSymbolStateProvider(BaseSymbolStateProvider):
             xs = np.array(x)
             ys = close[xs]
             r = np.polyfit(xs, ys, deg=1, full=True)
+            residuals = r[1]
+            if residuals.size == 0:
+                continue
             r = {
                 "x": xs,
                 "y": ys.values,
                 "m": float(r[0][0]),
                 "b": float(r[0][1]),
-                "err": float(r[1][0]),  # / (xs.min()/close.size)
+                "err": float(residuals[0]),
                 "pp": [int(p) for p in xs],
             }
             if (
@@ -98,6 +100,8 @@ class TrendlinesSymbolStateProvider(BaseSymbolStateProvider):
                 lines.append(r)
 
         lines = sorted(lines, key=lambda x: x["err"])
+        if len(lines) == 0:
+            return []
         if len(lines) <= n_lines:
             return lines
 
@@ -148,8 +152,8 @@ class TrendlinesSymbolStateProvider(BaseSymbolStateProvider):
         return sorted(mlines, key=lambda x: x["err"])
 
     def provide(self):
-        cdt = self.stock_env.get_current_market_datetime()
-        data = self.stock_env.get_ohlcv(
+        cdt = self.env.get_current_market_datetime()
+        data = self.env.get_ohlcv(
             self.symbol, dt_from=cdt - timedelta(days=self.days_ago), dt_to=cdt
         )
         if len(data) < 5 * 4 * 6:
@@ -166,10 +170,10 @@ class TrendlinesSymbolStateProvider(BaseSymbolStateProvider):
             return {"trendlines": None}
 
         # compile
-        df_mi = data.iloc[mins]
+        df_mi = data.iloc[mins].copy()
         df_mi.loc[:, "type"] = "MIN"
         df_mi.loc[:, "ind"] = df_mi["datetime"].apply(lambda dt: (cdt - dt).days)
-        df_ma = data.iloc[maxs]
+        df_ma = data.iloc[maxs].copy()
         df_ma.loc[:, "type"] = "MAX"
         df_ma.loc[:, "ind"] = df_ma["datetime"].apply(lambda dt: (cdt - dt).days)
 
@@ -277,29 +281,28 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
             np.log(df_bbnd["hh"] - df_bbnd["ll"]) - np.log(df_bbnd["atr"])
         ) / np.log(hurst_exp_length)
 
-        # bridge bands
-        df.loc[:, "bridge_bands_lower"] = df_bbnd["bb_lower"] + (
+        # bridge bands — write results into the copy, not the original df
+        df_bbnd.loc[:, "bridge_bands_lower"] = df_bbnd["bb_lower"] + (
             (df_bbnd["br_lower"] - df_bbnd["bb_lower"])
             * abs(df_bbnd["hurst_exp"] * 2 - 1)
         )
-        df.loc[:, "bridge_bands_upper"] = df_bbnd["bb_upper"] - (
+        df_bbnd.loc[:, "bridge_bands_upper"] = df_bbnd["bb_upper"] - (
             (df_bbnd["bb_upper"] - df_bbnd["br_upper"])
             * abs(df_bbnd["hurst_exp"] * 2 - 1)
         )
-        df.loc[:, "hurst_exp"] = df_bbnd["hurst_exp"]
 
-        df.loc[:, "bridge_bands_pos"] = (
-            2
-            * (
-                (df["close"] - df["bridge_bands_lower"])
-                / (df["bridge_bands_upper"] - df["bridge_bands_lower"])
-            )
-            - 1
+        band_width = df_bbnd["bridge_bands_upper"] - df_bbnd["bridge_bands_lower"]
+        df_bbnd.loc[:, "bridge_bands_pos"] = (
+            2 * ((df_bbnd["close"] - df_bbnd["bridge_bands_lower"]) / band_width) - 1
         )
-        df.loc[:, "bridge_bands_width"] = (
-            (df["bridge_bands_upper"] - df["bridge_bands_lower"])
-            - (df["bridge_bands_upper"] - df["bridge_bands_lower"]).mean()
-        ) / (df["bridge_bands_upper"] - df["bridge_bands_lower"]).std()
+        df_bbnd.loc[:, "bridge_bands_width"] = (
+            (band_width - band_width.mean()) / band_width.std()
+        )
+
+        # Copy only the result columns back to df
+        for col in ["bridge_bands_lower", "bridge_bands_upper", "hurst_exp",
+                    "bridge_bands_pos", "bridge_bands_width"]:
+            df.loc[:, col] = df_bbnd[col]
 
         return df
 

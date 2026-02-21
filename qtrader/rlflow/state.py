@@ -16,17 +16,18 @@ class StateProviderTask(BaseTask):
         env: BaseMarketEnv,
         pprovider: BasePersistenceProvider,
         cls_state_provider,
-        params: dict = {},
+        params: dict = None,
         allow_cache: bool = False,
         **kwargs,
     ):
         super(StateProviderTask, self).__init__(env, pprovider, **kwargs)
         self.cls_state_provider = cls_state_provider
-        self.params = params
+        self.params = params or {}
         self.params_hashed = hashlib.md5(
-            json.dumps(params, sort_keys=True).encode()
+            json.dumps(self.params, sort_keys=True).encode()
         ).hexdigest()
         self.allow_cache = allow_cache
+        self._memory_cache = {}  # in-memory layer; SQLite remains the durable store
 
     def _key(self, symbol: str, cdt: datetime):
         return f"Flow-State-{cdt.strftime('%Y%m%d%H')}-{symbol}-{self.cls_state_provider.__name__}-{self.params_hashed}"
@@ -39,17 +40,27 @@ class StateProviderTask(BaseTask):
 
         if self.allow_cache and cache_enabled:
             ckey = self._key(symbol, env.get_current_market_datetime())
-            # check if precomputed already
+
+            # 1. Check in-memory cache (instant, no deserialization)
+            if ckey in self._memory_cache:
+                env.log(
+                    f"\tStateProviderTask[{self.cls_state_provider}][{symbol}] - Time: {round(time.time() - st, 3)}s (mem)"
+                )
+                return self._memory_cache[ckey]
+
+            # 2. Check SQLite (cross-epoch cache hit)
             try:
                 r = pprovider.load_dict(ckey)
+                self._memory_cache[ckey] = r  # promote to memory
                 env.log(
-                    f"\tStateProviderTask[{self.cls_state_provider}][{symbol}] - Time: {round(time.time() - st, 3)}s"
+                    f"\tStateProviderTask[{self.cls_state_provider}][{symbol}] - Time: {round(time.time() - st, 3)}s (db)"
                 )
                 return r
 
-            except:
+            except Exception:
                 pass
 
+        # 3. Compute (cache miss)
         sp = None
         if issubclass(self.cls_state_provider, BaseSymbolStateProvider):
             sp = self.cls_state_provider(env, symbol, **self.params)
@@ -64,10 +75,11 @@ class StateProviderTask(BaseTask):
         sp.save_config(pprovider)
 
         if self.allow_cache and cache_enabled:
-            pprovider.persist_dict(ckey, rslt)
+            self._memory_cache[ckey] = rslt
+            pprovider.persist_dict(ckey, rslt)  # write-through to SQLite
 
         env.log(
-            f"\tStateProviderTask[{sp.__class__}][{symbol}] - Time: {round(time.time() - st, 3)}s"
+            f"\tStateProviderTask[{sp.__class__}][{symbol}] - Time: {round(time.time() - st, 3)}s (compute)"
         )
         return rslt
 
@@ -83,7 +95,7 @@ class StateAggregatorTask(BaseTask):
 
     def run(self, symbols: list, states_global: list, states_symbol: list) -> dict:
         state = {
-            "state_global": {"symbols": json.loads(json.dumps(symbols))},
+            "state_global": {"symbols": list(symbols)},
             "state_symbol": {},
         }
 

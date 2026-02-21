@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime
 from typing import List, Optional, Any
 from numpy import ndarray, int64, float32
+import msgpack
 
 
 class BasePersistenceProvider(object):
@@ -132,6 +133,11 @@ class SQLitePersistenceProvider(BasePersistenceProvider):
         self.dbname = dbname
         self.dbc = sqlite3.connect(self.root_join(dbname))
         self.dbexe = self.dbc.cursor()
+
+        # WAL mode: readers don't block writers, NORMAL sync reduces fsyncs
+        self.dbexe.execute("PRAGMA journal_mode=WAL;")
+        self.dbexe.execute("PRAGMA synchronous=NORMAL;")
+
         self.dbexe.execute(
             """
             CREATE TABLE IF NOT EXISTS data (
@@ -202,6 +208,74 @@ class SQLitePersistenceProvider(BasePersistenceProvider):
         return os.path.join(self.root, name)
 
 
+class CachedSQLitePersistenceProvider(SQLitePersistenceProvider):
+    """SQLite provider with in-memory read cache, batched writes, and msgpack serialization."""
+
+    def __init__(self, root: str, dbname: str = "db.sqlite", cache_size: int = 512, flush_interval: int = 50):
+        super().__init__(root, dbname)
+        self._write_buffer = {}           # name -> serialized payload
+        self._read_cache = {}             # name -> deserialized dict
+        self._cache_size = cache_size
+        self._flush_interval = flush_interval
+        self._write_count = 0
+
+    def persist_dict(self, name: str, obj: dict) -> None:
+        payload = msgpack.packb(obj, use_bin_type=True)
+        self._write_buffer[name] = payload
+        self._read_cache[name] = obj      # update read cache immediately
+        self._write_count += 1
+        if self._write_count >= self._flush_interval:
+            self.flush()
+
+    def load_dict(self, name: str) -> dict:
+        # 1. Check in-memory cache
+        if name in self._read_cache:
+            return self._read_cache[name]
+
+        # 2. Check write buffer (written but not yet flushed)
+        if name in self._write_buffer:
+            obj = msgpack.unpackb(self._write_buffer[name], raw=False)
+            self._read_cache[name] = obj
+            return obj
+
+        # 3. Fall through to SQLite
+        row = self.dbexe.execute(
+            "SELECT payload FROM data WHERE id = ?", (name,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(name)
+
+        # Try msgpack first, fall back to legacy gzip+json for existing data
+        try:
+            obj = msgpack.unpackb(row[0], raw=False)
+        except (msgpack.exceptions.UnpackValueError, msgpack.exceptions.ExtraData):
+            with BytesIO(row[0]) as s:
+                with gzip.open(s, "rb") as gz:
+                    obj = json.load(gz)
+
+        self._read_cache[name] = obj
+        self._evict_if_needed()
+        return obj
+
+    def flush(self):
+        """Flush all buffered writes to SQLite in a single transaction."""
+        if not self._write_buffer:
+            return
+        self.dbexe.executemany(
+            """INSERT INTO data (id, payload) VALUES (?, ?)
+               ON CONFLICT(id) DO UPDATE SET payload=excluded.payload;""",
+            [(k, sqlite3.Binary(v)) for k, v in self._write_buffer.items()],
+        )
+        self.dbc.commit()  # single fsync for the entire batch
+        self._write_buffer.clear()
+        self._write_count = 0
+
+    def _evict_if_needed(self):
+        """Evict oldest entries from read cache if over capacity."""
+        while len(self._read_cache) > self._cache_size:
+            self._read_cache.pop(next(iter(self._read_cache)))
+
+
 class LeanSQLitePersistenceProvider(SQLitePersistenceProvider):
 
     def __init__(self, prefix: str, lean_obj_store, dbname="db.sqlite"):
@@ -210,6 +284,23 @@ class LeanSQLitePersistenceProvider(SQLitePersistenceProvider):
 
         db_path = Path(self._request_path(dbname))
         super().__init__(db_path.parent, db_path.name)
+
+    def _request_path(self, filename):
+        return self.lean_obj_store.get_file_path(f"{self.prefix}/{filename}")
+
+    def root_join(self, name):
+        return self._request_path(name)
+
+
+class LeanCachedSQLitePersistenceProvider(CachedSQLitePersistenceProvider):
+    """Lean-integrated version of CachedSQLitePersistenceProvider."""
+
+    def __init__(self, prefix: str, lean_obj_store, dbname="db.sqlite", cache_size=512, flush_interval=50):
+        self.lean_obj_store = lean_obj_store
+        self.prefix = prefix
+
+        db_path = Path(self._request_path(dbname))
+        super().__init__(db_path.parent, db_path.name, cache_size=cache_size, flush_interval=flush_interval)
 
     def _request_path(self, filename):
         return self.lean_obj_store.get_file_path(f"{self.prefix}/{filename}")
