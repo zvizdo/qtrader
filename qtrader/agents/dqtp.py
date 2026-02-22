@@ -32,7 +32,8 @@ class DQTPAgent(BaseAgent):
         invest_pct=0.02,
         n_steps_warmup=1000,
         n_step_update=10,
-        n_steps_target_update=1000,
+        n_steps_checkpoint=1000,
+        target_tau=0.005,
         exp_memory_size=365,
         exp_mini_batch_size=128,
         exp_weighting=0.4,
@@ -60,7 +61,8 @@ class DQTPAgent(BaseAgent):
         self.invest_pct = invest_pct
 
         self.n_step_update = n_step_update
-        self.n_steps_target_update = n_steps_target_update
+        self.n_steps_checkpoint = n_steps_checkpoint
+        self.target_tau = target_tau
         self.n_steps_warmup = n_steps_warmup
 
         self.exp_memory_size = exp_memory_size
@@ -85,7 +87,7 @@ class DQTPAgent(BaseAgent):
 
         self.n_steps = 0  # needs to be loaded and persisted
         self.n_updates = 0  # needs to be loaded and persisted
-        self.n_updates_target = 0  # needs to be loaded and persisted
+        self.n_checkpoints = 0  # needs to be loaded and persisted
 
         self.state_list = "QAgent-State"
         self.state_prefix = f"{self.state_list}"
@@ -111,7 +113,7 @@ class DQTPAgent(BaseAgent):
             self.expl_rate = c.get("expl_rate", self.expl_rate)
             self.n_steps = c.get("n_steps", 0)
             self.n_updates = c.get("n_updates", 0)
-            self.n_updates_target = c.get("n_updates_target", 0)
+            self.n_checkpoints = c.get("n_checkpoints", 0)
             self.exp_weighting = c.get("exp_weighting", self.exp_weighting)
 
             path = self.pprovider.root_join(self.rb_prefix)
@@ -128,7 +130,7 @@ class DQTPAgent(BaseAgent):
                 "expl_rate": self.expl_rate,
                 "n_steps": self.n_steps,
                 "n_updates": self.n_updates,
-                "n_updates_target": self.n_updates_target,
+                "n_checkpoints": self.n_checkpoints,
                 "exp_weighting": self.exp_weighting,
             },
         )
@@ -205,9 +207,7 @@ class DQTPAgent(BaseAgent):
 
         return actions
 
-    def feedback(
-        self, state: dict, action: dict, reward: dict, state_future: dict
-    ) -> None:
+    def feedback(self, state: dict, action: dict, reward: dict, state_future: dict) -> None:
         # find valid state for symbols
         symbols_valid = [
             sy
@@ -244,6 +244,21 @@ class DQTPAgent(BaseAgent):
                 days_in_trade = 0.0
             reward[sy]["days_in_trade"] = days_in_trade
 
+            # Real commission as fraction of account value
+            # If a position change occurred, the triggering order is the last
+            # order in state_future's trade data (it was filled between state
+            # and state_future).  When no trade fires, comm_frac is 0.
+            p_t = 1.0 if action[sy]["action_private"] == self.ACTION_LONG else 0.0
+            p_t_prev = reward[sy]["position_prev_indicator"]
+            account_value = state["state_global"]["account"]["value"]
+            comm_frac = 0.0
+            if abs(p_t - p_t_prev) > 0.5:
+                trade_future = state_future["state_symbol"][sy]["trade"]
+                if trade_future:
+                    last_order = trade_future[-1]
+                    comm_frac = last_order.get("comm", 0.0) / (account_value + 1e-8)
+            reward[sy]["comm_frac"] = comm_frac
+
         # update state
         state["reward"] = reward
         state["state_future"] = state_future
@@ -251,7 +266,7 @@ class DQTPAgent(BaseAgent):
         # persist updated state
         if not self.no_full_state:
             dt = to_dt(state["state_global"]["account"]["current_datetime"]).strftime(
-                "%Y%m%d%H"
+                "%Y%m%d%H%M"
             )
             state_name = f"{self.state_prefix}-{self.name}-{dt}"
             self.pprovider.persist_dict(name=state_name, obj=state)
@@ -275,29 +290,30 @@ class DQTPAgent(BaseAgent):
             self.exp_weighting = min(1.0, self.exp_weighting + self.exp_w_inc)
             self.n_updates += 1
             run_learn = True
-
-            # print(f"EXPL. RATE: {self.expl_rate}")
-
-        if self.n_updates > 0 and self.n_steps % self.n_steps_target_update == 0:
-            self.expl_rate = max(self.expl_min, self.expl_rate * self.expl_decay)
-            self.n_updates_target += 1
             self.copy_weights_to_target()
+
+        if self.n_updates > 0 and self.n_steps % self.n_steps_checkpoint == 0:
+            self.expl_rate = max(self.expl_min, self.expl_rate * self.expl_decay)
+            self.n_checkpoints += 1
             self.save_model(online=True)
             self.save_model(online=False)
 
-            #print(f"MODEL TARGET UPDATED!")
-
         self.n_steps += 1
-        # print(
-        #     f"N_STEP: {self.n_steps} / N_UPDATES: {self.n_updates} / N_UPDATES_TARGET: {self.n_updates_target}"
-        # )
 
         return run_learn
+
+    # Lookback indices: 15m, 1h, 4h on 15-minute bars
+    _LOOKBACKS = [1, 4, 16]
+
+    # Bridge Bands state keys (micro → daily → weekly)
+    _BB_KEYS = ["bridge_bnds_micro", "bridge_bnds_daily", "bridge_bnds_weekly"]
+
+    # MACD state keys (micro → daily → weekly)
+    _MACD_KEYS = ["macd_12_26_9", "macd_96_288_96", "macd_480_960_192"]
 
     def _generate_example(self, symbol: str, state: dict) -> list:
         ex = []
 
-        # START: POSITION
         cdt = to_dt(state["state_global"]["account"]["current_datetime"])
         account_value = state["state_global"]["account"]["value"]
 
@@ -311,15 +327,17 @@ class DQTPAgent(BaseAgent):
         cs_high = ohlcv["high"][-1]
         cs_low = ohlcv["low"][-1]
 
-        # START: TIME
+        # ── TIME (6 features) ──
         ex.append(math.cos(math.pi * cdt.weekday() / 3))
         ex.append(math.sin(math.pi * cdt.weekday() / 3))
+        ex.append(math.cos(2 * math.pi * cdt.hour / 24))
+        ex.append(math.sin(2 * math.pi * cdt.hour / 24))
+        ex.append(math.cos(2 * math.pi * cdt.minute / 60))
+        ex.append(math.sin(2 * math.pi * cdt.minute / 60))
 
-        # START: POSITION Direction / Exposure Flag
-        # This is exactly 1.0 if in position (LONG), 0.0 if not (FLAT)
+        # ── POSITION (5 features) ──
         ex.append(0.0 if not pos else float(np.sign(pos["size"])))
 
-        # POSITION Profit (Return on current equity)
         if not pos:
             ex.append(0.0)
         else:
@@ -329,13 +347,11 @@ class DQTPAgent(BaseAgent):
                 * math.log1p(100 * abs(return_on_current_equity))
             )
 
-        # Trade duration features
         ex.append(0.0 if not pos else math.log1p(len(trade)))
 
         if trade:
             trade_end_dt = to_dt(trade[-1]["datetime"])
             days_since_last = abs((cdt - trade_end_dt).total_seconds()) / 86400.0
-
             ex.append(0.0 if not pos else math.exp(-days_since_last / 28.0))
 
             if pos:
@@ -348,69 +364,59 @@ class DQTPAgent(BaseAgent):
             ex.append(0.0)
             ex.append(0.0)
 
-        # START: BRIDGE BANDS
-        bb = sym_state["bridge_bnds"]
-        bb_w = bb["bridge_bands_width"]
-        bb_pos = bb["bridge_bands_pos"]
-        bb_hexp = bb["hurst_exp"]
-
-        # Volatility-Normalized OHLC Returns
-        vol = abs(bb_w[-1]) + 1e-8
+        # ── VOL-NORMALIZED OHLC (3 features) ──
+        bb_micro = sym_state["bridge_bnds_micro"]
+        vol = abs(bb_micro["bridge_bands_width"][-1]) + 1e-8
         ex.append((1.0 - cs_open / price) / vol)
         ex.append((1.0 - cs_high / price) / vol)
         ex.append((1.0 - cs_low / price) / vol)
 
-        for i in [1, 3, 7]:
-            ex.append(bb_w[-i])
-            ex.append(bb_pos[-i])
-            ex.append(bb_hexp[-i])
+        # ── BRIDGE BANDS × 3 scales (9 features each = 27 total) ──
+        for bb_key in self._BB_KEYS:
+            bb = sym_state[bb_key]
+            bb_w = bb["bridge_bands_width"]
+            bb_pos = bb["bridge_bands_pos"]
+            bb_hexp = bb["hurst_exp"]
+            for i in self._LOOKBACKS:
+                ex.append(bb_w[-i])
+                ex.append(bb_pos[-i])
+                ex.append(bb_hexp[-i])
 
-        # START: MACD
-        macd_short = sym_state["macd_12_26_9"]
-        macd_long = sym_state["macd_50_200_35"]
-
-        ms_macd  = macd_short["macd"]
-        ms_hist  = macd_short["macd_hist"]
-        ml_macd  = macd_long["macd"]
-        ml_hist  = macd_long["macd_hist"]
-
-        for i in [1, 3, 7]:
-            ex.append(ms_macd[-i])
-            ex.append(ms_hist[-i])
-            ex.append(ml_macd[-i])
-            ex.append(ml_hist[-i])
+        # ── MACD × 3 scales (6 features each = 18 total) ──
+        for macd_key in self._MACD_KEYS:
+            macd = sym_state[macd_key]
+            m_macd = macd["macd"]
+            m_hist = macd["macd_hist"]
+            for i in self._LOOKBACKS:
+                ex.append(m_macd[-i])
+                ex.append(m_hist[-i])
 
         return ex
 
     def _generate_reward(self, rewards):
         """
-        Reward(t+1) = P(t) * Market_Return
-                    - Cost * |P(t) - P(t-1)|
-                    - P(t) * alpha * (exp(days_in_trade / tau) - 1)
+        Reward(t) = P(t) * Net_Return
+                  - P(t) * alpha_step * (exp(days_in_trade / tau_days) - 1)
 
-        P(t)             = 1 for ACTION_LONG, 0 for ACTION_FLAT
-        Market_Return    = ln(Close(t+1) / Close(t)) * 10
-        Cost             = transaction_cost (per position change)
-        alpha            = 0.002  (~10% of typical 2% daily BTC log return)
-        tau              = 14 days (exponential time constant)
+        Net_Return   = (market_log_return - comm_frac) * scale
+        scale        = 960 (10 * 96 bars/day)
+        tau_days     = 14.0 (time constant in days)
+        alpha_step   = 0.002 / 96 (daily alpha spread across 96 intraday steps)
         """
-        transaction_cost = 0.01
-        alpha = 0.002  # 10% of typical daily BTC log return (~0.02)
-        tau = 14.0  # days; penalty doubles roughly every tau days
+        scale = 960
+        tau_days = 14.0
+        alpha_step = 0.002 / 96.0
 
         def _compute_single_reward(re):
             p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
-            p_t_prev = re.get("position_prev_indicator", 0.0)
-            market_return = re.get("market_log_return", 0.0) * 10
+            raw_return = re.get("market_log_return", 0.0)
+            comm_frac = re.get("comm_frac", 0.0)
             days_in_trade = re.get("days_in_trade", 0.0)
 
-            holding_penalty = p_t * alpha * (np.exp(days_in_trade / tau) - 1)
+            net_return = (raw_return - comm_frac) * scale
+            holding_penalty = p_t * alpha_step * (np.exp(days_in_trade / tau_days) - 1)
 
-            return (
-                p_t * market_return
-                - transaction_cost * abs(p_t - p_t_prev)
-                - holding_penalty
-            )
+            return p_t * net_return - holding_penalty
 
         r = np.array([_compute_single_reward(re) for re in rewards])
         return r
@@ -490,13 +496,10 @@ class DQTPAgent(BaseAgent):
         q_values_future[pa == 0] = -np.inf
         q_f_action_index = np.argmax(q_values_future, axis=1)
 
-        if self.n_updates_target > 0:
-            q_values_future_t = model_target.predict(
-                examples_all[r:], verbose=0, batch_size=1024
-            )
-            q_t_t = q_values_future_t[rws, q_f_action_index]
-        else:
-            q_t_t = q_values_future[rws, q_f_action_index]
+        q_values_future_t = model_target.predict(
+            examples_all[r:], verbose=0, batch_size=1024
+        )
+        q_t_t = q_values_future_t[rws, q_f_action_index]
         q_a_t = reward + self.rl_gamma * q_t_t
 
         tds = np.abs(q_a_t - q_a) + 1e-6
@@ -602,7 +605,7 @@ class DQTPAgent(BaseAgent):
         )
 
     def copy_weights_to_target(self):
-        """Copy online model weights to the target model in-memory."""
+        """Soft-update target model weights via Polyak averaging."""
         if self.model_online is None:
             return
         if self.model_target is None:
@@ -610,7 +613,17 @@ class DQTPAgent(BaseAgent):
                 input_size=self.model_online.input_shape[1],
                 output_size=self.model_online.output_shape[1],
             )
-        self.model_target.set_weights(self.model_online.get_weights())
+            self.model_target.set_weights(self.model_online.get_weights())
+            return
+        tau = self.target_tau
+        updated = [
+            tau * w_online + (1 - tau) * w_target
+            for w_online, w_target in zip(
+                self.model_online.get_weights(),
+                self.model_target.get_weights(),
+            )
+        ]
+        self.model_target.set_weights(updated)
 
     def _model_callbacks(self, model_type):
         cb_model_checkpoint = tf.keras.callbacks.ModelCheckpoint(

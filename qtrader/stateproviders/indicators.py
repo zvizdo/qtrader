@@ -205,9 +205,17 @@ class TrendlinesSymbolStateProvider(BaseSymbolStateProvider):
 
 class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
 
-    def __init__(self, env: BaseMarketEnv, symbol: str, days_ago: int = 365, **kwargs):
+    def __init__(self, env: BaseMarketEnv, symbol: str, days_ago: int = 365,
+                 bridge_range_length: int = 14, bollinger_bands_length: int = 14,
+                 bollinger_bands_num_std: int = 2, hurst_exp_length: int = 14,
+                 state_key: str = "bridge_bnds", **kwargs):
         super(BridgeBandsSymbolStateProvider, self).__init__(env, symbol, **kwargs)
         self.days_ago = days_ago
+        self.bridge_range_length = bridge_range_length
+        self.bollinger_bands_length = bollinger_bands_length
+        self.bollinger_bands_num_std = bollinger_bands_num_std
+        self.hurst_exp_length = hurst_exp_length
+        self.state_key = state_key
 
     @staticmethod
     def calculate_bridge_bands(
@@ -311,13 +319,21 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
         data = self.env.get_ohlcv(
             self.symbol, dt_from=cdt - timedelta(days=self.days_ago), dt_to=cdt
         )
-        if len(data) < 5 * 4 * 6:
-            return {"bridge_bnds": None}
+        min_rows = max(self.bridge_range_length, self.bollinger_bands_length,
+                       self.hurst_exp_length) * 2
+        if len(data) < min_rows:
+            return {self.state_key: None}
 
         data["datetime"] = data["datetime"].apply(lambda x: x.isoformat())
-        data = BridgeBandsSymbolStateProvider.calculate_bridge_bands(data)
+        data = BridgeBandsSymbolStateProvider.calculate_bridge_bands(
+            data,
+            bridge_range_length=self.bridge_range_length,
+            bollinger_bands_length=self.bollinger_bands_length,
+            bollinger_bands_num_std=self.bollinger_bands_num_std,
+            hurst_exp_length=self.hurst_exp_length,
+        )
 
-        return {"bridge_bnds": data.to_dict(orient="list")}
+        return {self.state_key: data.to_dict(orient="list")}
 
 
 class MACDSymbolStateProvider(BaseSymbolStateProvider):

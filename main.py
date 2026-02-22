@@ -23,6 +23,7 @@ tf.random.set_seed(seed_value)
 
 # region Imports
 from AlgorithmImports import *
+from QuantConnect.Data.Consolidators import TradeBarConsolidator
 
 import json
 from pathlib import Path
@@ -60,6 +61,8 @@ from qtrader.stateproviders.indicators import (
 
 class QTraderAlgorithm(QCAlgorithm):
 
+    BAR_PERIOD = timedelta(minutes=15)
+
     def _load_run_params(self):
         params = {}
         try:
@@ -86,7 +89,7 @@ class QTraderAlgorithm(QCAlgorithm):
             invest_pct=0.05,
             n_steps_warmup=int(params.get("n_steps_warmup", 1024)),
             n_step_update=int(params.get("n_step_update", 4)),
-            n_steps_target_update=int(params.get("n_steps_target_update", 5000)),
+            n_steps_checkpoint=int(params.get("n_steps_checkpoint", 5000)),
             exp_memory_size=int(params.get("exp_memory_size", 365 * 100_000)),
             exp_mini_batch_size=int(params.get("exp_mini_batch_size", 32)),
             exp_weighting=float(params.get("exp_weighting", 0.4)),
@@ -113,8 +116,8 @@ class QTraderAlgorithm(QCAlgorithm):
         self.debug(run_params)
 
         run_type = "LIVE" if self.live_mode else run_params.get("run_type", "TRAIN")
-        date_start = datetime.fromisoformat(run_params.get("date_start", "2018-01-01"))
-        date_end = datetime.fromisoformat(run_params.get("date_end", "2019-01-01"))
+        date_start = datetime.fromisoformat(run_params.get("date_start", "2018-04-05"))
+        date_end = datetime.fromisoformat(run_params.get("date_end", "2018-04-06"))
 
         self.set_start_date(date_start.year, date_start.month, date_start.day)
         self.set_end_date(date_end.year, date_end.month, date_end.day)
@@ -127,20 +130,26 @@ class QTraderAlgorithm(QCAlgorithm):
             TradeBuilder(FillGroupingMethod.FLAT_TO_FLAT, FillMatchingMethod.FIFO)
         )
 
-        self.exchange = self.add_crypto("BTCUSD", Resolution.DAILY)
+        self.exchange = self.add_crypto("BTCUSD", Resolution.MINUTE)
         self.symbol = self.exchange.symbol
         self.set_time_zone(self.exchange.exchange.time_zone)
+
+        # Consolidator: 1-min → BAR_PERIOD bars
+        self._consolidator = TradeBarConsolidator(self.BAR_PERIOD)
+        self._consolidator.data_consolidated += self._on_consolidated_bar
+        self.subscription_manager.add_consolidator(self.symbol, self._consolidator)
 
         # persistance
         self.pprovider = LeanCachedSQLitePersistenceProvider(
             prefix=base_name, lean_obj_store=self.object_store, 
-            cache_size=1024, flush_interval=256
+            cache_size=16384, flush_interval=256
         )
         assert isinstance(self.pprovider, BasePersistenceProvider)
 
         # market env
         self.menv = LeanMarketEnv(
             qcl=self, pprovider=self.pprovider,
+            bar_period=self.BAR_PERIOD,
             verbose=(run_type == "LIVE"),
         )
         assert isinstance(self.menv, BaseMarketEnv)
@@ -177,45 +186,85 @@ class QTraderAlgorithm(QCAlgorithm):
             self.menv,
             self.pprovider,
             OHLCVSymbolStateProvider,
-            params={"days_ago": 365},
+            params={"days_ago": 4},
             name="OHLCVSymbol",
             allow_cache=True,
         )
 
-        self.task_ssp_bb = StateProviderTask(
+        # -- Bridge Bands: micro (3.5h structure) --
+        self.task_ssp_bb_micro = StateProviderTask(
             self.menv,
             self.pprovider,
             BridgeBandsSymbolStateProvider,
-            params={"days_ago": 365},
-            name="BridgeBandsSymbol",
+            params={"days_ago": 4, "bridge_range_length": 14,
+                    "bollinger_bands_length": 14, "hurst_exp_length": 14,
+                    "state_key": "bridge_bnds_micro"},
+            name="BBMicro",
+            allow_cache=True,
+        )
+        # -- Bridge Bands: daily (1-day volatility regime) --
+        self.task_ssp_bb_daily = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            BridgeBandsSymbolStateProvider,
+            params={"days_ago": 10, "bridge_range_length": 96,
+                    "bollinger_bands_length": 96, "hurst_exp_length": 96,
+                    "state_key": "bridge_bnds_daily"},
+            name="BBDaily",
+            allow_cache=True,
+        )
+        # -- Bridge Bands: weekly (5-day trend regime) --
+        self.task_ssp_bb_weekly = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            BridgeBandsSymbolStateProvider,
+            params={"days_ago": 30, "bridge_range_length": 480,
+                    "bollinger_bands_length": 480, "hurst_exp_length": 480,
+                    "state_key": "bridge_bnds_weekly"},
+            name="BBWeekly",
             allow_cache=True,
         )
 
-        self.task_ssp_macd_sht = StateProviderTask(
+        # -- MACD: micro (intraday momentum, 12/26/9 on 15m bars) --
+        self.task_ssp_macd_micro = StateProviderTask(
             self.menv,
             self.pprovider,
             MACDSymbolStateProvider,
             params={
-                "days_ago": 365,
+                "days_ago": 4,
                 "ema_short_length": 12,
                 "ema_long_length": 26,
                 "signal_length": 9,
             },
-            name="MACDSymbolShort",
+            name="MACDMicro",
             allow_cache=True,
         )
-
-        self.task_ssp_macd_lng = StateProviderTask(
+        # -- MACD: daily (swing momentum, ~1d/3d) --
+        self.task_ssp_macd_daily = StateProviderTask(
             self.menv,
             self.pprovider,
             MACDSymbolStateProvider,
             params={
-                "days_ago": 365 * 3,
-                "ema_short_length": 50,
-                "ema_long_length": 200,
-                "signal_length": 35,
+                "days_ago": 10,
+                "ema_short_length": 96,
+                "ema_long_length": 288,
+                "signal_length": 96,
             },
-            name="MACDSymbolLong",
+            name="MACDDaily",
+            allow_cache=True,
+        )
+        # -- MACD: weekly (macro momentum, ~5d/10d) --
+        self.task_ssp_macd_weekly = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            MACDSymbolStateProvider,
+            params={
+                "days_ago": 30,
+                "ema_short_length": 480,
+                "ema_long_length": 960,
+                "signal_length": 192,
+            },
+            name="MACDWeekly",
             allow_cache=True,
         )
 
@@ -240,13 +289,14 @@ class QTraderAlgorithm(QCAlgorithm):
         self.p_cache_enabled = True
 
     def on_data(self, data: Slice):
-        """on_data event is the primary entry point for your algorithm. Each new data point will be pumped in here.
-        Arguments:
-            data: Slice object keyed by symbol containing the stock data
-        """
+        """Minute-level tick handler — all logic lives in _on_consolidated_bar."""
+        pass
+
+    def _on_consolidated_bar(self, sender, bar):
+        """Fires every BAR_PERIOD with a consolidated TradeBar."""
         cur_date = self.menv.get_current_market_datetime()
-        self.menv.log(f"DAY: {cur_date}")
-        if cur_date + timedelta(days=1) >= self.end_date:  # last day, close all
+        self.menv.log(f"BAR: {cur_date}")
+        if cur_date + self.BAR_PERIOD >= self.end_date:  # last bar, close all
             for sy in self.p_symbols:
                 self.menv.execute_close_position(sy)
 
@@ -270,16 +320,28 @@ class QTraderAlgorithm(QCAlgorithm):
             self.task_ssp_ohlcv.run(symbol=sy, cache_enabled=self.p_cache_enabled)
             for sy in self.p_symbols
         ]
-        rslt_task_ssp_bb = [
-            self.task_ssp_bb.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+        rslt_task_ssp_bb_micro = [
+            self.task_ssp_bb_micro.run(symbol=sy, cache_enabled=self.p_cache_enabled)
             for sy in self.p_symbols
         ]
-        rslt_task_ssp_macd_sht = [
-            self.task_ssp_macd_sht.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+        rslt_task_ssp_bb_daily = [
+            self.task_ssp_bb_daily.run(symbol=sy, cache_enabled=self.p_cache_enabled)
             for sy in self.p_symbols
         ]
-        rslt_task_ssp_macd_lng = [
-            self.task_ssp_macd_lng.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+        rslt_task_ssp_bb_weekly = [
+            self.task_ssp_bb_weekly.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_macd_micro = [
+            self.task_ssp_macd_micro.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_macd_daily = [
+            self.task_ssp_macd_daily.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
+        rslt_task_ssp_macd_weekly = [
+            self.task_ssp_macd_weekly.run(symbol=sy, cache_enabled=self.p_cache_enabled)
             for sy in self.p_symbols
         ]
 
@@ -290,9 +352,12 @@ class QTraderAlgorithm(QCAlgorithm):
                 rslt_task_ssp_position,
                 rslt_task_ssp_trade,
                 rslt_task_ssp_ohlcv,
-                rslt_task_ssp_bb,
-                rslt_task_ssp_macd_sht,
-                rslt_task_ssp_macd_lng,
+                rslt_task_ssp_bb_micro,
+                rslt_task_ssp_bb_daily,
+                rslt_task_ssp_bb_weekly,
+                rslt_task_ssp_macd_micro,
+                rslt_task_ssp_macd_daily,
+                rslt_task_ssp_macd_weekly,
             ],
         )
 
@@ -315,7 +380,7 @@ class QTraderAlgorithm(QCAlgorithm):
 
         self.task_feedback.run(self.p_state_prev, state)
         self.menv.log(
-            f"\tMODEL STATS: N_STEP: {self.agent.n_steps} / N_UPDATES: {self.agent.n_updates} / N_UPDATES_TARGET: {self.agent.n_updates_target}"
+            f"\tMODEL STATS: N_STEP: {self.agent.n_steps} / N_UPDATES: {self.agent.n_updates} / N_CHECKPOINTS: {self.agent.n_checkpoints}"
         )
         self.menv.log(
             f"\tMODEL STATS: EXPL_RATE: {self.agent.expl_rate} / EXP_W: {self.agent.exp_weighting}"

@@ -211,13 +211,14 @@ class SQLitePersistenceProvider(BasePersistenceProvider):
 class CachedSQLitePersistenceProvider(SQLitePersistenceProvider):
     """SQLite provider with in-memory read cache, batched writes, and msgpack serialization."""
 
-    def __init__(self, root: str, dbname: str = "db.sqlite", cache_size: int = 512, flush_interval: int = 50):
+    def __init__(self, root: str, dbname: str = "db.sqlite", cache_size: int = 16384, flush_interval: int = 50):
         super().__init__(root, dbname)
         self._write_buffer = {}           # name -> serialized payload
         self._read_cache = {}             # name -> deserialized dict
         self._cache_size = cache_size
         self._flush_interval = flush_interval
         self._write_count = 0
+        self._warm_cache()
 
     def persist_dict(self, name: str, obj: dict) -> None:
         payload = msgpack.packb(obj, use_bin_type=True)
@@ -269,6 +270,20 @@ class CachedSQLitePersistenceProvider(SQLitePersistenceProvider):
         self.dbc.commit()  # single fsync for the entire batch
         self._write_buffer.clear()
         self._write_count = 0
+
+    def _warm_cache(self):
+        """Pre-fill read cache from SQLite at init (up to cache_size)."""
+        rows = self.dbexe.execute(
+            "SELECT id, payload FROM data LIMIT ?", (self._cache_size,)
+        ).fetchall()
+        for name, payload in rows:
+            try:
+                obj = msgpack.unpackb(payload, raw=False)
+            except (msgpack.exceptions.UnpackValueError, msgpack.exceptions.ExtraData):
+                with BytesIO(payload) as s:
+                    with gzip.open(s, "rb") as gz:
+                        obj = json.load(gz)
+            self._read_cache[name] = obj
 
     def _evict_if_needed(self):
         """Evict oldest entries from read cache if over capacity."""

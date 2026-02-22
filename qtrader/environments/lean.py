@@ -1,4 +1,4 @@
-from AlgorithmImports import OrderProperties, TimeInForce, OrderDirection, OrderStatus
+from AlgorithmImports import OrderProperties, TimeInForce, OrderDirection, OrderStatus, Resolution
 
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -8,12 +8,13 @@ from qtrader.rlflow.persistence import BasePersistenceProvider
 
 class LeanMarketEnv(BaseMarketEnv):
 
-    def __init__(self, qcl, pprovider: BasePersistenceProvider, verbose=True):
+    def __init__(self, qcl, pprovider: BasePersistenceProvider, bar_period: timedelta = timedelta(minutes=15), verbose=True):
         super().__init__()
 
         self.qcl = qcl  # QuantConnect Lean Env
 
         self.pprovider = pprovider
+        self.bar_period = bar_period
         self.verbose = verbose
         self._comm_cache = {}  # order_id -> commission (filled orders don't change)
 
@@ -30,15 +31,31 @@ class LeanMarketEnv(BaseMarketEnv):
 
     def get_ohlcv(self, symbol, dt_from, dt_to=None):
         sy = self.qcl.portfolio[symbol].symbol
-        cols = ["datetime", "open", "high", "low", "close", "volume"]
+        empty = pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
         if not dt_to:
             dt_to = self.get_current_market_datetime()
 
-        df = self.qcl.history(sy, dt_from, dt_to)
-        df["datetime"] = df.index.get_level_values("time")
-        df = df[cols]
+        df = self.qcl.history(sy, dt_from, dt_to, Resolution.MINUTE)
+        if df.empty:
+            return empty
 
-        return df.reset_index(drop=True)
+        df = df.reset_index()
+        df = df.rename(columns={"time": "datetime"})
+
+        # Resample 1-min bars to bar_period (matches Lean TradeBarConsolidator: left-closed, right-open)
+        resample_rule = f"{int(self.bar_period.total_seconds() // 60)}min"
+        df = df.set_index("datetime")
+        df = df[["open", "high", "low", "close", "volume"]]
+        df = df.resample(resample_rule).agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }).dropna(subset=["close"])
+        df = df.reset_index()
+
+        return df
 
     def execute_buy_market(self, symbol, size):
         self.qcl.market_order(symbol, size)

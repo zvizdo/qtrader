@@ -32,7 +32,7 @@ def objective(trial):
             "exp_w_inc": 5e-5,
             # ===== TUNED =====
             "expl_min": trial.suggest_float("expl_min", 0.01, 0.15, step=0.01),
-            "n_steps_target_update": trial.suggest_int("n_steps_target_update", 500, 5_000, step=250),
+            "n_steps_checkpoint": trial.suggest_int("n_steps_checkpoint", 500, 5_000, step=250),
             "exp_weighting": trial.suggest_float("exp_weighting", 0.3, 0.7, step=0.05),
             "exp_alpha": trial.suggest_float("exp_alpha", 0.3, 0.8, step=0.05),
             "model_lr": trial.suggest_categorical("model_lr", [1e-5, 5e-5, 1e-4]),

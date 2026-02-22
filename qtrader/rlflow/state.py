@@ -27,10 +27,9 @@ class StateProviderTask(BaseTask):
             json.dumps(self.params, sort_keys=True).encode()
         ).hexdigest()
         self.allow_cache = allow_cache
-        self._memory_cache = {}  # in-memory layer; SQLite remains the durable store
 
     def _key(self, symbol: str, cdt: datetime):
-        return f"Flow-State-{cdt.strftime('%Y%m%d%H')}-{symbol}-{self.cls_state_provider.__name__}-{self.params_hashed}"
+        return f"Flow-State-{cdt.strftime('%Y%m%d%H%M')}-{symbol}-{self.cls_state_provider.__name__}-{self.params_hashed}"
 
     def run(self, symbol: str = None, cache_enabled: bool = False, **kwargs) -> dict:
         st = time.time()
@@ -41,26 +40,17 @@ class StateProviderTask(BaseTask):
         if self.allow_cache and cache_enabled:
             ckey = self._key(symbol, env.get_current_market_datetime())
 
-            # 1. Check in-memory cache (instant, no deserialization)
-            if ckey in self._memory_cache:
-                env.log(
-                    f"\tStateProviderTask[{self.cls_state_provider}][{symbol}] - Time: {round(time.time() - st, 3)}s (mem)"
-                )
-                return self._memory_cache[ckey]
-
-            # 2. Check SQLite (cross-epoch cache hit)
             try:
                 r = pprovider.load_dict(ckey)
-                self._memory_cache[ckey] = r  # promote to memory
                 env.log(
-                    f"\tStateProviderTask[{self.cls_state_provider}][{symbol}] - Time: {round(time.time() - st, 3)}s (db)"
+                    f"\tStateProviderTask[{self.cls_state_provider}][{symbol}] - Time: {round(time.time() - st, 3)}s (cache)"
                 )
                 return r
 
             except Exception:
                 pass
 
-        # 3. Compute (cache miss)
+        # Compute (cache miss)
         sp = None
         if issubclass(self.cls_state_provider, BaseSymbolStateProvider):
             sp = self.cls_state_provider(env, symbol, **self.params)
@@ -75,8 +65,7 @@ class StateProviderTask(BaseTask):
         sp.save_config(pprovider)
 
         if self.allow_cache and cache_enabled:
-            self._memory_cache[ckey] = rslt
-            pprovider.persist_dict(ckey, rslt)  # write-through to SQLite
+            pprovider.persist_dict(ckey, rslt)
 
         env.log(
             f"\tStateProviderTask[{sp.__class__}][{symbol}] - Time: {round(time.time() - st, 3)}s (compute)"
