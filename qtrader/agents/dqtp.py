@@ -101,6 +101,9 @@ class DQTPAgent(BaseAgent):
 
         self.learn_timer = dict()
         self.td_tracker, self.td_tracker_n = 0, 0
+        self.loss_tracker, self.loss_tracker_n = 0.0, 0
+        self.q_value_tracker, self.q_value_tracker_n = 0.0, 0
+        self.reward_tracker, self.reward_tracker_n = 0.0, 0
 
     def load_config(self):
         try:
@@ -269,7 +272,6 @@ class DQTPAgent(BaseAgent):
             self.n_steps > self.n_steps_warmup
             and self.n_steps % self.n_step_update == 0
         ):
-            self.expl_rate = max(self.expl_min, self.expl_rate * self.expl_decay)
             self.exp_weighting = min(1.0, self.exp_weighting + self.exp_w_inc)
             self.n_updates += 1
             run_learn = True
@@ -277,6 +279,7 @@ class DQTPAgent(BaseAgent):
             # print(f"EXPL. RATE: {self.expl_rate}")
 
         if self.n_updates > 0 and self.n_steps % self.n_steps_target_update == 0:
+            self.expl_rate = max(self.expl_min, self.expl_rate * self.expl_decay)
             self.n_updates_target += 1
             self.copy_weights_to_target()
             self.save_model(online=True)
@@ -443,6 +446,10 @@ class DQTPAgent(BaseAgent):
         examples_all[r:] = [s[2] for s in states]
         reward = self._generate_reward([s[3] for s in states])
 
+        # Track mean shaped reward
+        self.reward_tracker += reward.mean()
+        self.reward_tracker_n += 1
+
         if self.model_online is None:
             self.model_online = self._create_model(
                 input_size=columns,
@@ -476,6 +483,10 @@ class DQTPAgent(BaseAgent):
 
         q = q_values
         q_a = q[a_index]
+
+        # Track mean Q-value across the batch
+        self.q_value_tracker += q_values.mean()
+        self.q_value_tracker_n += 1
         q_values_future[pa == 0] = -np.inf
         q_f_action_index = np.argmax(q_values_future, axis=1)
 
@@ -502,18 +513,20 @@ class DQTPAgent(BaseAgent):
         st = tm.time()
 
         try:
-            model_online.fit(
+            history = model_online.fit(
                 x=X,
                 y=y,
                 batch_size=self.exp_mini_batch_size,
                 epochs=1,
-                # validation_data=(X, y),
-                # validation_batch_size=self.exp_mini_batch_size,
                 sample_weight=weights,
                 shuffle=False,
-                verbose=2,
-                # callbacks=self._model_callbacks(mt)
+                verbose=0,
             )
+
+            # Track Keras training loss
+            if history and history.history.get("loss"):
+                self.loss_tracker += history.history["loss"][-1]
+                self.loss_tracker_n += 1
 
         except Exception as e:
             print(f"EXCEPTION model_online.fit: {e}")
@@ -524,11 +537,7 @@ class DQTPAgent(BaseAgent):
         self.learn_timer["model_fit"] = round(tm.time() - st, 3)
         self.learn_timer["total"] = round(tm.time() - st_total, 3)
 
-    def _create_model(
-        self,
-        input_size: int,
-        output_size: int,
-    ):
+    def _create_model(self, input_size: int, output_size: int):
         ki = tf.keras.initializers.GlorotUniform(seed=42)
 
         layers = [

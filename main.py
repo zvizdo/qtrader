@@ -139,7 +139,10 @@ class QTraderAlgorithm(QCAlgorithm):
         assert isinstance(self.pprovider, BasePersistenceProvider)
 
         # market env
-        self.menv = LeanMarketEnv(qcl=self, pprovider=self.pprovider)
+        self.menv = LeanMarketEnv(
+            qcl=self, pprovider=self.pprovider,
+            verbose=(run_type == "LIVE"),
+        )
         assert isinstance(self.menv, BaseMarketEnv)
 
         # region Agent
@@ -337,16 +340,40 @@ class QTraderAlgorithm(QCAlgorithm):
         if hasattr(self.pprovider, 'flush'):
             self.pprovider.flush()
 
-        if hasattr(self.agent, "td_tracker_n") and self.agent.td_tracker_n > 0:
+        agent = self.agent
+
+        # -- DQN convergence metrics --
+        if hasattr(agent, "td_tracker_n") and agent.td_tracker_n > 0:
             self.set_summary_statistic(
-                "mean_td_error",
-                self.agent.td_tracker / self.agent.td_tracker_n,
+                "mean_td_error", agent.td_tracker / agent.td_tracker_n
             )
 
-        self.set_summary_statistic(
-            "mean_reward",
-            self.task_feedback.ttl_reward / self.task_feedback.num_feedbacks,
-        )
+        if hasattr(agent, "loss_tracker_n") and agent.loss_tracker_n > 0:
+            self.set_summary_statistic(
+                "mean_loss", agent.loss_tracker / agent.loss_tracker_n
+            )
+
+        if hasattr(agent, "q_value_tracker_n") and agent.q_value_tracker_n > 0:
+            self.set_summary_statistic(
+                "mean_q_value", agent.q_value_tracker / agent.q_value_tracker_n
+            )
+
+        # -- Reward metrics --
+        if hasattr(agent, "reward_tracker_n") and agent.reward_tracker_n > 0:
+            self.set_summary_statistic(
+                "mean_shaped_reward", agent.reward_tracker / agent.reward_tracker_n
+            )
+
+        if self.task_feedback.num_feedbacks > 0:
+            self.set_summary_statistic(
+                "mean_portfolio_change",
+                self.task_feedback.ttl_reward / self.task_feedback.num_feedbacks,
+            )
+
+        # -- Agent state --
+        self.set_summary_statistic("exploration_rate", agent.expl_rate)
+        self.set_summary_statistic("n_updates", agent.n_updates)
+        self.set_summary_statistic("replay_buffer_size", agent.rb.size)
 
         self.log(
             "{} - TotalPortfolioValue: {}".format(

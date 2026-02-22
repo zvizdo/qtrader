@@ -9,13 +9,13 @@ import argparse
 import click
 import json
 import optuna
-import tensorflow as tf
 from lean.commands.backtest import backtest as run_lean_backtest
 from lean.commands.report import report as run_report
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
 from qtrader.rlflow.persistence import SQLitePersistenceProvider, PersistenceJSONEncoder
+from qtrader.logging import TrainingLogger
 
 
 TR_INFO__STEP = "TRAINING_INFO__STEP"
@@ -69,6 +69,7 @@ def run_backtest(
                 output=output_path,
                 detach=False,
                 no_update=True,
+                # extra_config=[("log-level", "error")]
             )
             last_exc = None
             break
@@ -110,41 +111,6 @@ def run_backtest(
     return s
 
 
-def tfb_record(writer, step, mode, stats):
-    ttl_perf = stats["totalPerformance"]
-
-    pnl = lambda s: float(s["portfolioStatistics"]["endEquity"]) - float(
-        s["portfolioStatistics"]["startEquity"]
-    )
-    num_trades = lambda s: int(s["tradeStatistics"]["totalNumberOfTrades"])
-    num_orders = lambda s: len(s["orders"].keys())
-    sh_ratio = lambda s: float(s["portfolioStatistics"]["sharpeRatio"])
-    so_ratio = lambda s: float(s["portfolioStatistics"]["sortinoRatio"])
-
-    with writer.as_default(step=step):
-        if mode == "TRAIN":
-            if "mean_td_error" in stats["statistics"]:
-                tf.summary.scalar(
-                    f"{mode}/mean_td_error", float(stats["statistics"]["mean_td_error"])
-                )
-
-            if "mean_reward" in stats["statistics"]:
-                tf.summary.scalar(
-                    f"{mode}/mean_reward", float(stats["statistics"]["mean_reward"])
-                )
-
-        elif mode == "EVAL":
-            tf.summary.scalar(f"{mode}/profit", pnl(ttl_perf))
-            tf.summary.scalar(
-                f"{mode}/sharpe_ratio",
-                sh_ratio(ttl_perf),
-            )
-            tf.summary.scalar(f"{mode}/sortino_ratio", so_ratio(ttl_perf))
-            tf.summary.scalar(f"{mode}/num_trades", num_trades(ttl_perf))
-            tf.summary.scalar(f"{mode}/num_orders", num_orders(stats))
-        writer.flush()
-
-
 def trainer_run(name, iters, params, n_test=5, prune=None):
     proj_path = pathlib.Path(__file__).parent.resolve()
     trial_dir = proj_path.joinpath(f"../trials/{name}").resolve()
@@ -158,9 +124,10 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
     pprovider = SQLitePersistenceProvider(root=config_dir_f(""))
     dump_params(config_dir_f, run_params)
 
-    tfb_writer = tf.summary.create_file_writer(
-        logdir=str(proj_path.joinpath(f"../trials/{'tfboard'}/{name}").resolve())
+    logger = TrainingLogger(
+        log_dir=str(proj_path.joinpath(f"../trials/{'tfboard'}/{name}").resolve())
     )
+    logger.log_hyperparams(params)
 
     print(f"START [{name}]: {params}")
     step = 0
@@ -186,7 +153,7 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
         stats = run_backtest(
             proj_path, config_dir_f, iter_dir_f, name, iter_name, run_params, True
         )
-        tfb_record(tfb_writer, step=step, mode=run_params["run_type"], stats=stats)
+        logger.log_train_step(step=step, stats=stats)
         # endregion
 
         if (i + 1) % n_test > 0 and (i + 1) != iters:
@@ -205,21 +172,27 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
             proj_path, config_dir_f, iter_dir_f, name, eval_name, run_params, False
         )
         eval_stats.append(stats)
-        tfb_record(tfb_writer, step=step, mode=run_params["run_type"], stats=stats)
+        logger.log_eval_step(step=step, stats=stats)
         # endregion
 
-        # Fix #8: only raise TrialPruned when running inside Optuna (prune is not None)
-        num_orders = lambda s: len(s["orders"].keys())
-        if prune is not None and step >= 50 and num_orders(stats) <= 15:
-            raise optuna.TrialPruned()
+        # Multi-metric hard prune (only when running inside Optuna)
+        if prune is not None and step >= 200:
+            port_stats = stats.get("totalPerformance", {}).get("portfolioStatistics", {})
+            sharpe = float(port_stats.get("sharpeRatio", 0))
+            drawdown = float(port_stats.get("drawdown", 0))
+            num_trades = len(stats.get("orders", {}).keys())
 
+            if num_trades <= 10 or drawdown > 0.5 or sharpe < -1.0:
+                raise optuna.TrialPruned()
+
+        # Percentile-based pruning via Optuna callback
         if prune is not None and callable(prune):
             prune(
                 float(stats["totalPerformance"]["portfolioStatistics"]["sharpeRatio"]),
                 step,
             )
 
-    tfb_writer.close()
+    logger.close()
     return stats
 
 
@@ -236,3 +209,4 @@ if __name__ == "__main__":
     params = args.params if args.params is not None else {}
 
     trainer_run(name, iters, params, n_test=10)
+

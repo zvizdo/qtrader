@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from qtrader.environments.base import BaseMarketEnv
 from qtrader.stateproviders import BaseStateProvider, BaseSymbolStateProvider
 
@@ -24,13 +24,10 @@ class PositionSymbolStateProvider(BaseSymbolStateProvider):
 class TradeSymbolStateProvider(BaseSymbolStateProvider):
 
     def provide(self):
-        cdt = self.env.get_current_market_datetime()
-
+        trades = self.env.get_trades(self.symbol, dt_since=datetime(2010, 1, 1))
         return {
-            "trade": self.env.get_trade(self.symbol),
-            "trades": self.env.get_trades(
-                self.symbol, dt_since=cdt - timedelta(days=4 * 7 * 3)
-            ),
+            "trade": trades[-1] if trades else [],
+            "trades": trades,
         }
 
 

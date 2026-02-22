@@ -8,12 +8,14 @@ from qtrader.rlflow.persistence import BasePersistenceProvider
 
 class LeanMarketEnv(BaseMarketEnv):
 
-    def __init__(self, qcl, pprovider: BasePersistenceProvider):
+    def __init__(self, qcl, pprovider: BasePersistenceProvider, verbose=True):
         super().__init__()
 
         self.qcl = qcl  # QuantConnect Lean Env
 
         self.pprovider = pprovider
+        self.verbose = verbose
+        self._comm_cache = {}  # order_id -> commission (filled orders don't change)
 
     # START: LeanMarketEnv
 
@@ -70,16 +72,29 @@ class LeanMarketEnv(BaseMarketEnv):
 
     def get_trades(self, symbol, dt_since):
         def map_order(o):
+            fill_time = o.last_fill_time.replace(tzinfo=None)
+
+            # Extract actual commission, cached per order ID
+            if o.id not in self._comm_cache:
+                comm = 0.0
+                try:
+                    ticket = self.qcl.transactions.get_order_ticket(o.id)
+                    for evt in ticket.order_events:
+                        comm += abs(float(evt.order_fee.value.amount))
+                except Exception:
+                    pass
+                self._comm_cache[o.id] = comm
+
             return {
                 "id": o.id,
                 "symbol": symbol,
-                "ts": o.time.replace(tzinfo=None).isoformat(),
-                "datetime": o.time.replace(tzinfo=None).isoformat(),
+                "ts": fill_time.isoformat(),
+                "datetime": fill_time.isoformat(),
                 "price": o.price,
                 "size": o.absolute_quantity,
                 "instruction": "BUY" if o.quantity > 0 else "SELL",
                 "size_instruction": o.quantity,
-                "comm": 0,
+                "comm": self._comm_cache[o.id],
             }
 
         sy = self.qcl.portfolio[symbol].symbol
@@ -88,7 +103,6 @@ class LeanMarketEnv(BaseMarketEnv):
             lambda x: x.symbol == sy and x.status == OrderStatus.FILLED
         )
 
-        # Bug fix: Sort orders by fill time to ensure chronological grouping
         orders = sorted(orders, key=lambda x: x.last_fill_time)
 
         ti = 0
@@ -122,6 +136,7 @@ class LeanMarketEnv(BaseMarketEnv):
         return []
 
     def log(self, msg):
-        self.qcl.debug(msg)
+        if self.verbose:
+            self.qcl.debug(msg)
 
     # END: LeanMarketEnv
