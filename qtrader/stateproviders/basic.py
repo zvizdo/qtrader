@@ -33,9 +33,10 @@ class TradeSymbolStateProvider(BaseSymbolStateProvider):
 
 class OHLCVSymbolStateProvider(BaseSymbolStateProvider):
 
-    def __init__(self, env: BaseMarketEnv, symbol: str, days_ago: int = 365, **kwargs):
+    def __init__(self, env: BaseMarketEnv, symbol: str, days_ago: int = 365, cache_truncate: int = 24, **kwargs):
         super(OHLCVSymbolStateProvider, self).__init__(env, symbol, **kwargs)
         self.days_ago = days_ago
+        self.cache_truncate = cache_truncate
 
     def provide(self):
         cdt = self.env.get_current_market_datetime()
@@ -46,5 +47,7 @@ class OHLCVSymbolStateProvider(BaseSymbolStateProvider):
             return {"ohlcv": None}
 
         data["datetime"] = data["datetime"].apply(lambda x: x.isoformat())
+        if self.cache_truncate > 0:
+            data = data.tail(self.cache_truncate)
 
         return {"ohlcv": data.to_dict(orient="list")}

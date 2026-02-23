@@ -208,7 +208,7 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
     def __init__(self, env: BaseMarketEnv, symbol: str, days_ago: int = 365,
                  bridge_range_length: int = 14, bollinger_bands_length: int = 14,
                  bollinger_bands_num_std: int = 2, hurst_exp_length: int = 14,
-                 state_key: str = "bridge_bnds", **kwargs):
+                 state_key: str = "bridge_bnds", cache_truncate: int = 24, **kwargs):
         super(BridgeBandsSymbolStateProvider, self).__init__(env, symbol, **kwargs)
         self.days_ago = days_ago
         self.bridge_range_length = bridge_range_length
@@ -216,6 +216,7 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
         self.bollinger_bands_num_std = bollinger_bands_num_std
         self.hurst_exp_length = hurst_exp_length
         self.state_key = state_key
+        self.cache_truncate = cache_truncate
 
     @staticmethod
     def calculate_bridge_bands(
@@ -333,6 +334,9 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
             hurst_exp_length=self.hurst_exp_length,
         )
 
+        if self.cache_truncate > 0:
+            data = data.tail(self.cache_truncate)
+
         return {self.state_key: data.to_dict(orient="list")}
 
 
@@ -346,6 +350,7 @@ class MACDSymbolStateProvider(BaseSymbolStateProvider):
         ema_short_length: int = 12,
         ema_long_length: int = 26,
         signal_length: int = 9,
+        cache_truncate: int = 24,
         **kwargs,
     ):
         super(MACDSymbolStateProvider, self).__init__(env, symbol, **kwargs)
@@ -353,6 +358,7 @@ class MACDSymbolStateProvider(BaseSymbolStateProvider):
         self.ema_short_length = ema_short_length
         self.ema_long_length = ema_long_length
         self.signal_length = signal_length
+        self.cache_truncate = cache_truncate
 
     @staticmethod
     def calculate_macd(df, ema_short_length=12, ema_long_length=26, signal_length=9):
@@ -390,6 +396,9 @@ class MACDSymbolStateProvider(BaseSymbolStateProvider):
             signal_length=self.signal_length,
         )
         df_macd["datetime"] = df_macd["datetime"].apply(lambda x: x.isoformat())
+
+        if self.cache_truncate > 0:
+            df_macd = df_macd.tail(self.cache_truncate)
 
         return {
             f"macd_{self.ema_short_length}_{self.ema_long_length}_{self.signal_length}": df_macd[

@@ -23,7 +23,7 @@ def objective(trial):
             "invest_pct": 0.05,
             "expl_decay": 0.98,
             "n_steps_warmup": 1024 * 10,
-            "n_step_update": 2,
+            "n_step_update": 96, # once per day
             "model_n_layers": 2,
             "model_fl_size": 128,
             "model_shape": "cone",

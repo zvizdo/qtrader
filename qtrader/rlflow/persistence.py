@@ -290,6 +290,36 @@ class CachedSQLitePersistenceProvider(SQLitePersistenceProvider):
         while len(self._read_cache) > self._cache_size:
             self._read_cache.pop(next(iter(self._read_cache)))
 
+    def warm_cache_for_range(self, symbol: str, date_start, date_end):
+        """Load all Flow-State cache entries for a symbol within [date_start, date_end] into memory.
+
+        Uses the key format Flow-State-{symbol}-{YYYYMMDDHHMM}-... so that a simple
+        range query on the id column efficiently selects matching rows.
+        """
+        prefix = f"Flow-State-{symbol}-"
+        key_lo = f"{prefix}{date_start.strftime('%Y%m%d')}0000"
+        key_hi = f"{prefix}{date_end.strftime('%Y%m%d')}2359"
+
+        rows = self.dbexe.execute(
+            "SELECT id, payload FROM data WHERE id >= ? AND id <= ?",
+            (key_lo, key_hi),
+        ).fetchall()
+
+        loaded = 0
+        for name, payload in rows:
+            if name in self._read_cache:
+                continue
+            try:
+                obj = msgpack.unpackb(payload, raw=False)
+            except (msgpack.exceptions.UnpackValueError, msgpack.exceptions.ExtraData):
+                with BytesIO(payload) as s:
+                    with gzip.open(s, "rb") as gz:
+                        obj = json.load(gz)
+            self._read_cache[name] = obj
+            loaded += 1
+
+        return loaded
+
 
 class LeanSQLitePersistenceProvider(SQLitePersistenceProvider):
 

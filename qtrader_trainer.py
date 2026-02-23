@@ -57,7 +57,6 @@ def run_backtest(
     dump_params(config_dir_f, run_params, run_name=run_name)
 
     output_path = iter_dir_f(run_name)
-    # Fix #9: log exceptions on each retry; raise if all attempts fail
     last_exc = None
     for t in np.random.randint(0, 16, size=5):
         time.sleep(t)
@@ -111,11 +110,22 @@ def run_backtest(
     return s
 
 
-def trainer_run(name, iters, params, n_test=5, prune=None):
+def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
     proj_path = pathlib.Path(__file__).parent.resolve()
     trial_dir = proj_path.joinpath(f"../trials/{name}").resolve()
     iter_dir_f = lambda x: trial_dir.joinpath(f"{x}").resolve()
     config_dir_f = lambda x: proj_path.joinpath(f"../storage/{name}/{x}").resolve()
+
+    # Golden cache DB: pre-computed state provider outputs
+    if golden_db is None:
+        golden_db = proj_path.joinpath("../storage/cache/golden_cache.db").resolve()
+    else:
+        golden_db = pathlib.Path(golden_db).resolve()
+
+    if not golden_db.exists():
+        print(f"WARNING: Golden cache DB not found at {golden_db}. "
+              "State providers will compute from scratch each iteration. "
+              "Run qtrader_warmup.py to create it.")
 
     run_params = {"run_type": "EVAL", "hyperparams": params}
     data_start_date = datetime(2016, 1, 1)
@@ -136,6 +146,13 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
     except:
         pprovider.persist_dict(name=TR_INFO__STEP, obj=step)
 
+    # Copy golden cache DB into storage folder (once, before training loop)
+    if golden_db.exists():
+        dst = config_dir_f("").joinpath("db.sqlite")
+        if not dst.exists():
+            shutil.copy2(golden_db, dst)
+            print(f"Golden cache DB copied to {dst}")
+
     eval_stats = []
     for i in range(iters):
         # region Run Iteration
@@ -146,7 +163,7 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
         iter_name = f"Iter{str(step).zfill(6)}"
         run_params["run_type"] = "TRAIN"
         run_params["date_start"] = data_start_date + timedelta(
-            days=np.random.randint(0, 365 * 2)
+            days=np.random.randint(0, 365 * 4)
         )
         run_params["date_end"] = run_params["date_start"] + relativedelta(years=3)
 
@@ -164,8 +181,8 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
         run_params.update(
             {
                 "run_type": "EVAL",
-                "date_start": datetime(2021, 1, 1),
-                "date_end": datetime(2024, 12, 31),
+                "date_start": datetime(2023, 2, 1),
+                "date_end": datetime(2026, 1, 31),
             }
         )
         stats = run_backtest(

@@ -142,7 +142,7 @@ class QTraderAlgorithm(QCAlgorithm):
         # persistance
         self.pprovider = LeanCachedSQLitePersistenceProvider(
             prefix=base_name, lean_obj_store=self.object_store, 
-            cache_size=16384, flush_interval=256
+            cache_size=1_000_000, flush_interval=256
         )
         assert isinstance(self.pprovider, BasePersistenceProvider)
 
@@ -154,17 +154,21 @@ class QTraderAlgorithm(QCAlgorithm):
         )
         assert isinstance(self.menv, BaseMarketEnv)
 
-        # region Agent
+        self.p_run_type = run_type
 
-        # agent = RandomAgent()
-        agent = self._create_agent(
-            base_name, self.pprovider, run_params.get("hyperparams", {})
-        )
-        assert isinstance(agent, DQTPAgent)
-        agent.no_learn = True if run_type in ("EVAL", "LIVE") else False
-        agent.no_full_state = False if run_type == "LIVE" else True
-        agent.load_config()
-        self.agent = agent
+        # region Agent (skip for WARMUP — no agent needed)
+
+        if run_type == "WARMUP":
+            self.agent = None
+        else:
+            agent = self._create_agent(
+                base_name, self.pprovider, run_params.get("hyperparams", {})
+            )
+            assert isinstance(agent, DQTPAgent)
+            agent.no_learn = True if run_type in ("EVAL", "LIVE") else False
+            agent.no_full_state = False if run_type == "LIVE" else True
+            agent.load_config()
+            self.agent = agent
 
         # endregion
 
@@ -272,21 +276,23 @@ class QTraderAlgorithm(QCAlgorithm):
 
         # endregion
 
-        # region Action
+        # region Action & Feedback (skip for WARMUP)
 
-        self.task_act = ActTask(self.menv, self.pprovider, agent=agent)
-
-        # endregion
-
-        # region Feedback
-
-        self.task_feedback = FeedbackTask(self.menv, self.pprovider, agent=agent)
+        if run_type != "WARMUP":
+            self.task_act = ActTask(self.menv, self.pprovider, agent=self.agent)
+            self.task_feedback = FeedbackTask(self.menv, self.pprovider, agent=self.agent)
 
         # endregion
 
         self.p_symbols = [self.symbol.value]
         self.p_state_prev = None
         self.p_cache_enabled = True
+
+        # Warm the in-memory cache from SQLite for the iteration's date range
+        if run_type != "WARMUP" and hasattr(self.pprovider, 'warm_cache_for_range'):
+            for sy in self.p_symbols:
+                n = self.pprovider.warm_cache_for_range(sy, date_start, date_end)
+                self.debug(f"Warm cache loaded {n} entries for {sy} [{date_start} → {date_end}]")
 
     def on_data(self, data: Slice):
         """Minute-level tick handler — all logic lives in _on_consolidated_bar."""
@@ -297,12 +303,13 @@ class QTraderAlgorithm(QCAlgorithm):
         cur_date = self.menv.get_current_market_datetime()
         self.menv.log(f"BAR: {cur_date}")
         if cur_date + self.BAR_PERIOD >= self.end_date:  # last bar, close all
-            for sy in self.p_symbols:
-                self.menv.execute_close_position(sy)
+            if self.p_run_type != "WARMUP":
+                for sy in self.p_symbols:
+                    self.menv.execute_close_position(sy)
 
             return
 
-        # region Create state
+        # region Create state (runs for ALL modes including WARMUP)
 
         rslt_task_sp_acc_info = self.task_sp_acc_info.run(
             cache_enabled=self.p_cache_enabled
@@ -363,6 +370,10 @@ class QTraderAlgorithm(QCAlgorithm):
 
         # endregion
 
+        # WARMUP mode: only compute state (already cached above), skip agent
+        if self.p_run_type == "WARMUP":
+            return
+
         # region Create action
 
         actions, state = self.task_act.run(state)
@@ -396,14 +407,17 @@ class QTraderAlgorithm(QCAlgorithm):
         self.debug("{} {}".format(self.time, order_event.to_string()))
 
     def on_end_of_algorithm(self):
+        # flush any buffered persistence writes
+        if hasattr(self.pprovider, 'flush'):
+            self.pprovider.flush()
+
+        if self.p_run_type == "WARMUP":
+            return
+
         if not self.agent.no_learn:
             self.agent.save_config()
             self.agent.save_model(online=True)
             self.agent.save_model(online=False)
-
-        # flush any buffered persistence writes
-        if hasattr(self.pprovider, 'flush'):
-            self.pprovider.flush()
 
         agent = self.agent
 

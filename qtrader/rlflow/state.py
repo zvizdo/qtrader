@@ -29,7 +29,7 @@ class StateProviderTask(BaseTask):
         self.allow_cache = allow_cache
 
     def _key(self, symbol: str, cdt: datetime):
-        return f"Flow-State-{cdt.strftime('%Y%m%d%H%M')}-{symbol}-{self.cls_state_provider.__name__}-{self.params_hashed}"
+        return f"Flow-State-{symbol}-{cdt.strftime('%Y%m%d%H%M')}-{self.cls_state_provider.__name__}-{self.params_hashed}"
 
     def run(self, symbol: str = None, cache_enabled: bool = False, **kwargs) -> dict:
         st = time.time()
