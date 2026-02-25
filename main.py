@@ -22,8 +22,19 @@ tf.random.set_seed(seed_value)
 # endregion
 
 # region Imports
-from AlgorithmImports import *
-from QuantConnect.Data.Consolidators import TradeBarConsolidator
+from QuantConnect.Indicators import RollingWindow
+from AlgorithmImports import (
+    AccountType,
+    BrokerageName,
+    FillGroupingMethod,
+    FillMatchingMethod,
+    QCAlgorithm,
+    Resolution,
+    Slice,
+    TradeBuilder,
+    TradeBarConsolidator,
+    TradeBar,
+)
 
 import json
 from pathlib import Path
@@ -134,15 +145,29 @@ class QTraderAlgorithm(QCAlgorithm):
         self.symbol = self.exchange.symbol
         self.set_time_zone(self.exchange.exchange.time_zone)
 
+        # Create rolling window for the maximum lookback (approx 36 days of 15-min bars)
+        self.history_window = RollingWindow[TradeBar](3500)
+
         # Consolidator: 1-min → BAR_PERIOD bars
         self._consolidator = TradeBarConsolidator(self.BAR_PERIOD)
+        self._consolidator.data_consolidated += lambda sender, bar: self.history_window.add(bar)
+
+        # -- WARMUP --
+        # Fetch minute bars and push them through the consolidator
+        self.debug("Warming up consolidator...")
+        history_bars = self.history[TradeBar](self.symbol, timedelta(days=36), Resolution.MINUTE)
+        for bar in history_bars:
+            self._consolidator.update(bar)
+        self.debug(f"Warmup complete. Window size: {self.history_window.count}")
+
+        # Now that memory is warmed up, attach RL logic and register with Lean
         self._consolidator.data_consolidated += self._on_consolidated_bar
         self.subscription_manager.add_consolidator(self.symbol, self._consolidator)
 
         # persistance
         self.pprovider = LeanCachedSQLitePersistenceProvider(
             prefix=base_name, lean_obj_store=self.object_store, 
-            cache_size=1_000_000, flush_interval=256
+            cache_size=1_000_000, flush_interval=1024
         )
         assert isinstance(self.pprovider, BasePersistenceProvider)
 
@@ -412,12 +437,15 @@ class QTraderAlgorithm(QCAlgorithm):
             self.pprovider.flush()
 
         if self.p_run_type == "WARMUP":
+            self.pprovider.close()
             return
 
         if not self.agent.no_learn:
             self.agent.save_config()
             self.agent.save_model(online=True)
             self.agent.save_model(online=False)
+
+        self.pprovider.close()
 
         agent = self.agent
 

@@ -228,31 +228,34 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
     ):
         df_bbnd = df.copy()
 
-        # detrand / bridge range
-        df_bbnd.loc[:, "br_close"] = df_bbnd["close"].shift(bridge_range_length)
-        df_bbnd.loc[:, "br_slope"] = (
-            df_bbnd["close"] - df_bbnd["br_close"]
-        ) / bridge_range_length
-        df_bbnd.loc[:, "br_intercept"] = df_bbnd[
-            "br_close"
-        ]  # df_t['close'] - df_t['detrend_slope'] * DETREND_LENGTH
+        # detrend / bridge range
+        L = bridge_range_length
+        df_bbnd.loc[:, "br_close"] = df_bbnd["close"].shift(L)
+        df_bbnd.loc[:, "br_slope"] = (df_bbnd["close"] - df_bbnd["br_close"]) / L
+        df_bbnd.loc[:, "br_intercept"] = df_bbnd["br_close"]
 
-        br_upper = [None for _ in range(bridge_range_length)]
-        br_lower = [None for _ in range(bridge_range_length)]
-        for t in range(bridge_range_length, len(df_bbnd)):
-            slope = df_bbnd.iloc[t]["br_slope"]
-            intercept = df_bbnd.iloc[t]["br_intercept"]
-            trend = (
-                slope * np.linspace(0, bridge_range_length, bridge_range_length + 1)
-                + intercept
-            )
-            actual = df_bbnd.iloc[t - bridge_range_length : t + 1]["close"].values
-            diff = actual - trend
-            bb_max = np.abs(diff.max())
-            bb_min = np.abs(diff.min())
-
-            br_upper.append(df_bbnd.iloc[t]["close"] + (bb_max + bb_min))
-            br_lower.append(df_bbnd.iloc[t]["close"] - (bb_max + bb_min))
+        close_vals = df_bbnd['close'].values
+        
+        # Use sliding window for O(1) loop behavior
+        windows = np.lib.stride_tricks.sliding_window_view(close_vals, window_shape=L + 1)
+        
+        # Calculate slopes and intercepts for each window
+        # slope = (close[t] - close[t-L]) / L
+        slopes = (windows[:, -1] - windows[:, 0]) / L
+        intercepts = windows[:, 0]
+        
+        # trends: shape (N-L, L+1) 
+        # slopes: shape (N-L,)
+        trends = slopes[:, None] * np.arange(L + 1) + intercepts[:, None]
+        diffs = windows - trends
+        
+        max_min_sum = np.abs(diffs.max(axis=1)) + np.abs(diffs.min(axis=1))
+        
+        br_upper = np.full(len(close_vals), np.nan)
+        br_lower = np.full(len(close_vals), np.nan)
+        
+        br_upper[L:] = close_vals[L:] + max_min_sum
+        br_lower[L:] = close_vals[L:] - max_min_sum
 
         df_bbnd.loc[:, "br_upper"] = br_upper
         df_bbnd.loc[:, "br_lower"] = br_lower

@@ -20,10 +20,10 @@ def objective(trial):
         iters=500,
         params={
             # ===== STATIC =====
-            "invest_pct": 0.05,
+            "invest_pct": 0.4,
             "expl_decay": 0.98,
             "n_steps_warmup": 1024 * 10,
-            "n_step_update": 96, # once per day
+            "n_step_update": 48, # 96 is once per day
             "model_n_layers": 2,
             "model_fl_size": 128,
             "model_shape": "cone",

@@ -116,6 +116,15 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
     iter_dir_f = lambda x: trial_dir.joinpath(f"{x}").resolve()
     config_dir_f = lambda x: proj_path.joinpath(f"../storage/{name}/{x}").resolve()
 
+    # --- Training and Evaluation Period Config ---
+    train_period_start = datetime(2016, 1, 1)
+    train_period_end = datetime(2023, 1, 1) # Approximate 7 years from start
+    train_sample_duration_days = 35
+
+    eval_period_start = datetime(2023, 2, 1)
+    eval_period_end = datetime(2026, 1, 31)
+    eval_sample_duration_days = 70
+
     # Golden cache DB: pre-computed state provider outputs
     if golden_db is None:
         golden_db = proj_path.joinpath("../storage/cache/golden_cache.db").resolve()
@@ -128,9 +137,16 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
               "Run qtrader_warmup.py to create it.")
 
     run_params = {"run_type": "EVAL", "hyperparams": params}
-    data_start_date = datetime(2016, 1, 1)
 
     os.makedirs(config_dir_f(""), exist_ok=True)
+    # Copy golden cache DB into storage folder (once, before training loop)
+    if golden_db.exists():
+        dst = config_dir_f("").joinpath("db.sqlite")
+        print (f"Copying golden cache DB from {golden_db} to {dst}")
+        if not dst.exists():
+            shutil.copy2(golden_db, dst)
+            print(f"Golden cache DB copied to {dst}")
+
     pprovider = SQLitePersistenceProvider(root=config_dir_f(""))
     dump_params(config_dir_f, run_params)
 
@@ -146,13 +162,6 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
     except:
         pprovider.persist_dict(name=TR_INFO__STEP, obj=step)
 
-    # Copy golden cache DB into storage folder (once, before training loop)
-    if golden_db.exists():
-        dst = config_dir_f("").joinpath("db.sqlite")
-        if not dst.exists():
-            shutil.copy2(golden_db, dst)
-            print(f"Golden cache DB copied to {dst}")
-
     eval_stats = []
     for i in range(iters):
         # region Run Iteration
@@ -162,10 +171,10 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
 
         iter_name = f"Iter{str(step).zfill(6)}"
         run_params["run_type"] = "TRAIN"
-        run_params["date_start"] = data_start_date + timedelta(
-            days=np.random.randint(0, 365 * 4)
+        run_params["date_start"] = train_period_start + timedelta(
+            days=np.random.randint(0, (train_period_end - train_period_start).days - train_sample_duration_days)
         )
-        run_params["date_end"] = run_params["date_start"] + relativedelta(years=3)
+        run_params["date_end"] = run_params["date_start"] + timedelta(days=train_sample_duration_days)
 
         stats = run_backtest(
             proj_path, config_dir_f, iter_dir_f, name, iter_name, run_params, True
@@ -178,11 +187,17 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
 
         # region Run Eval
         eval_name = f"Eval{str(step).zfill(6)}"
+
+        eval_start = eval_period_start + timedelta(
+            days=np.random.randint(0, (eval_period_end - eval_period_start).days - eval_sample_duration_days)
+        )
+        eval_end = eval_start + timedelta(days=eval_sample_duration_days)
+
         run_params.update(
             {
                 "run_type": "EVAL",
-                "date_start": datetime(2023, 2, 1),
-                "date_end": datetime(2026, 1, 31),
+                "date_start": eval_start,
+                "date_end": eval_end,
             }
         )
         stats = run_backtest(

@@ -1,6 +1,7 @@
-from AlgorithmImports import OrderProperties, TimeInForce, OrderDirection, OrderStatus, Resolution
+from AlgorithmImports import OrderProperties, TimeInForce, OrderDirection, OrderStatus, Resolution, TradeBar
 
 import pandas as pd
+from functools import lru_cache
 from datetime import datetime, timezone, timedelta
 from qtrader.environments.base import BaseMarketEnv
 from qtrader.rlflow.persistence import BasePersistenceProvider
@@ -29,33 +30,42 @@ class LeanMarketEnv(BaseMarketEnv):
     def get_account_cash(self):
         return self.qcl.portfolio.cash_book["USD"].amount
 
+    @lru_cache(maxsize=128)
+    def _fetch_ohlcv_cached(self, symbol, dt_from, dt_to):
+        data = []
+        # Lean RollingWindow is ordered newest (index 0) to oldest
+        for bar in self.qcl.history_window:
+            dt = bar.time.replace(tzinfo=None)
+            
+            if dt > dt_to:
+                continue
+            if dt < dt_from:
+                break  # We've gone back far enough
+                
+            data.append({
+                "datetime": dt,
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": float(bar.volume)
+            })
+            
+        # Reverse to chronological order (oldest to newest)
+        data.reverse()
+        df = pd.DataFrame(data)
+        
+        if df.empty:
+            return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+            
+        return df
+
     def get_ohlcv(self, symbol, dt_from, dt_to=None):
         sy = self.qcl.portfolio[symbol].symbol
-        empty = pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
         if not dt_to:
             dt_to = self.get_current_market_datetime()
-
-        df = self.qcl.history(sy, dt_from, dt_to, Resolution.MINUTE)
-        if df.empty:
-            return empty
-
-        df = df.reset_index()
-        df = df.rename(columns={"time": "datetime"})
-
-        # Resample 1-min bars to bar_period (matches Lean TradeBarConsolidator: left-closed, right-open)
-        resample_rule = f"{int(self.bar_period.total_seconds() // 60)}min"
-        df = df.set_index("datetime")
-        df = df[["open", "high", "low", "close", "volume"]]
-        df = df.resample(resample_rule).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }).dropna(subset=["close"])
-        df = df.reset_index()
-
-        return df
+            
+        return self._fetch_ohlcv_cached(sy, dt_from, dt_to).copy()
 
     def execute_buy_market(self, symbol, size):
         self.qcl.market_order(symbol, size)

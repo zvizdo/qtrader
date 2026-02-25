@@ -35,6 +35,9 @@ class BasePersistenceProvider(object):
     def root_join(self, name: str) -> str:
         raise NotImplementedError()
 
+    def close(self) -> None:
+        pass
+
 
 class PersistenceJSONEncoder(JSONEncoder):
     def default(self, o):
@@ -206,6 +209,9 @@ class SQLitePersistenceProvider(BasePersistenceProvider):
 
     def root_join(self, name: str) -> str:
         return os.path.join(self.root, name)
+
+    def close(self) -> None:
+        self.dbc.close()
 
 
 class CachedSQLitePersistenceProvider(SQLitePersistenceProvider):
