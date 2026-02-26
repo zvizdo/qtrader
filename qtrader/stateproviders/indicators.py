@@ -290,7 +290,7 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
         ).max(axis=0)
         df_bbnd.loc[:, "atr"] = df_bbnd["tr"].rolling(hurst_exp_length).mean()
         df_bbnd.loc[:, "hurst_exp"] = (
-            np.log(df_bbnd["hh"] - df_bbnd["ll"]) - np.log(df_bbnd["atr"])
+            np.log(df_bbnd["hh"] - df_bbnd["ll"] + 1e-8) - np.log(df_bbnd["atr"] + 1e-8)
         ) / np.log(hurst_exp_length)
 
         # bridge bands — write results into the copy, not the original df
@@ -304,11 +304,13 @@ class BridgeBandsSymbolStateProvider(BaseSymbolStateProvider):
         )
 
         band_width = df_bbnd["bridge_bands_upper"] - df_bbnd["bridge_bands_lower"]
+        band_width_safe = np.where(band_width == 0, 1e-8, band_width)
         df_bbnd.loc[:, "bridge_bands_pos"] = (
-            2 * ((df_bbnd["close"] - df_bbnd["bridge_bands_lower"]) / band_width) - 1
+            2 * ((df_bbnd["close"] - df_bbnd["bridge_bands_lower"]) / band_width_safe) - 1
         )
+        band_width_std = band_width.std()
         df_bbnd.loc[:, "bridge_bands_width"] = (
-            (band_width - band_width.mean()) / band_width.std()
+            (band_width - band_width.mean()) / (band_width_std if band_width_std > 1e-8 else 1e-8)
         )
 
         # Copy only the result columns back to df
@@ -378,7 +380,7 @@ class MACDSymbolStateProvider(BaseSymbolStateProvider):
         )
 
         df_t["macd"] = 100 * (1 - df_t["ema_long"] / df_t["ema_short"])
-        df_t["macd"] = np.sign(df_t["macd"]) * np.log1p(np.abs(df_t["macd"]))
+        df_t["macd"] = np.sign(df_t["macd"]) * np.log1p(np.abs(df_t["macd"]) + 1e-8)
         df_t["macd_signal"] = df_t["macd"].ewm(span=signal_length, adjust=False).mean()
         df_t["macd_hist"] = df_t["macd"] - df_t["macd_signal"]
 

@@ -14,7 +14,7 @@ from lean.commands.report import report as run_report
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
-from qtrader.rlflow.persistence import SQLitePersistenceProvider, PersistenceJSONEncoder
+from qtrader.rlflow.persistence import DiskIndexPersistenceProvider, PersistenceJSONEncoder
 from qtrader.logging import TrainingLogger
 
 
@@ -110,7 +110,7 @@ def run_backtest(
     return s
 
 
-def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
+def trainer_run(name, iters, params, n_test=5, prune=None):
     proj_path = pathlib.Path(__file__).parent.resolve()
     trial_dir = proj_path.joinpath(f"../trials/{name}").resolve()
     iter_dir_f = lambda x: trial_dir.joinpath(f"{x}").resolve()
@@ -125,29 +125,11 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
     eval_period_end = datetime(2026, 1, 31)
     eval_sample_duration_days = 70
 
-    # Golden cache DB: pre-computed state provider outputs
-    if golden_db is None:
-        golden_db = proj_path.joinpath("../storage/cache/golden_cache.db").resolve()
-    else:
-        golden_db = pathlib.Path(golden_db).resolve()
-
-    if not golden_db.exists():
-        print(f"WARNING: Golden cache DB not found at {golden_db}. "
-              "State providers will compute from scratch each iteration. "
-              "Run qtrader_warmup.py to create it.")
-
     run_params = {"run_type": "EVAL", "hyperparams": params}
 
     os.makedirs(config_dir_f(""), exist_ok=True)
-    # Copy golden cache DB into storage folder (once, before training loop)
-    if golden_db.exists():
-        dst = config_dir_f("").joinpath("db.sqlite")
-        print (f"Copying golden cache DB from {golden_db} to {dst}")
-        if not dst.exists():
-            shutil.copy2(golden_db, dst)
-            print(f"Golden cache DB copied to {dst}")
 
-    pprovider = SQLitePersistenceProvider(root=config_dir_f(""))
+    pprovider = DiskIndexPersistenceProvider(root=str(config_dir_f("")))
     dump_params(config_dir_f, run_params)
 
     logger = TrainingLogger(
@@ -161,12 +143,15 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
         step = pprovider.load_dict(name=TR_INFO__STEP)
     except:
         pprovider.persist_dict(name=TR_INFO__STEP, obj=step)
+    pprovider.close()
 
     eval_stats = []
     for i in range(iters):
         # region Run Iteration
         step += 1
+        pprovider = DiskIndexPersistenceProvider(root=str(config_dir_f("")))
         pprovider.persist_dict(name=TR_INFO__STEP, obj=step)
+        pprovider.close()
         print(f"ITERATION: {i + 1}/{iters}")
 
         iter_name = f"Iter{str(step).zfill(6)}"
@@ -185,13 +170,19 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
         if (i + 1) % n_test > 0 and (i + 1) != iters:
             continue
 
+        is_last_iter = (i + 1) == iters
+
         # region Run Eval
         eval_name = f"Eval{str(step).zfill(6)}"
 
-        eval_start = eval_period_start + timedelta(
-            days=np.random.randint(0, (eval_period_end - eval_period_start).days - eval_sample_duration_days)
-        )
-        eval_end = eval_start + timedelta(days=eval_sample_duration_days)
+        if is_last_iter:
+            eval_start = eval_period_start
+            eval_end = eval_period_end
+        else:
+            eval_start = eval_period_start + timedelta(
+                days=np.random.randint(0, (eval_period_end - eval_period_start).days - eval_sample_duration_days)
+            )
+            eval_end = eval_start + timedelta(days=eval_sample_duration_days)
 
         run_params.update(
             {
@@ -207,22 +198,28 @@ def trainer_run(name, iters, params, n_test=5, prune=None, golden_db=None):
         logger.log_eval_step(step=step, stats=stats)
         # endregion
 
-        # Multi-metric hard prune (only when running inside Optuna)
-        if prune is not None and step >= 200:
-            port_stats = stats.get("totalPerformance", {}).get("portfolioStatistics", {})
-            sharpe = float(port_stats.get("sharpeRatio", 0))
-            drawdown = float(port_stats.get("drawdown", 0))
-            num_trades = len(stats.get("orders", {}).keys())
+        if not is_last_iter:
+            # Multi-metric hard prune (only when running inside Optuna)
+            if prune is not None and step >= 200:
+                port_stats = stats.get("totalPerformance", {}).get("portfolioStatistics", {})
+                sharpe = float(port_stats.get("sharpeRatio", 0))
+                drawdown = float(port_stats.get("drawdown", 0))
+                num_trades = len(stats.get("orders", {}).keys())
 
-            if num_trades <= 10 or drawdown > 0.5 or sharpe < -1.0:
-                raise optuna.TrialPruned()
+                if num_trades <= 10 or drawdown > 0.5 or sharpe < -1.0:
+                    raise optuna.TrialPruned()
 
-        # Percentile-based pruning via Optuna callback
-        if prune is not None and callable(prune):
-            prune(
-                float(stats["totalPerformance"]["portfolioStatistics"]["sharpeRatio"]),
-                step,
-            )
+            # Percentile-based pruning via Optuna callback
+            if prune is not None and callable(prune):
+                recent_sharpes = [
+                    float(s["totalPerformance"]["portfolioStatistics"]["sharpeRatio"])
+                    for s in eval_stats[-5:]
+                ]
+                w = np.array([0.45, 0.25, 0.15, 0.1, 0.05][:len(recent_sharpes)])
+                w = w / np.sum(w)
+                weighted_sharpe = float(np.sum(np.array(recent_sharpes[::-1]) * w))
+                
+                prune(weighted_sharpe, step)
 
     logger.close()
     return stats

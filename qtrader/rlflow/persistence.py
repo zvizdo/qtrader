@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import List, Optional, Any
 from numpy import ndarray, int64, float32
 import msgpack
-
+import diskcache
 
 class BasePersistenceProvider(object):
 
@@ -358,3 +358,83 @@ class LeanCachedSQLitePersistenceProvider(CachedSQLitePersistenceProvider):
 
     def root_join(self, name):
         return self._request_path(name)
+
+
+class DiskIndexPersistenceProvider(BasePersistenceProvider):
+    """Persistence provider backing standard obj/dict saves via diskcache.Index."""
+
+    def __init__(self, root: str):
+        super().__init__()
+        self.root = root
+        self.index = diskcache.Index(self.root)
+
+    def list(self, prefix: str) -> List[dict]:
+        # diskcache indices provide key iterators
+        for key in self.index:
+            if isinstance(key, str) and key.startswith(prefix):
+                yield key
+
+    def persist_dict(self, name: str, obj: dict) -> None:
+        payload = msgpack.packb(obj, use_bin_type=True)
+        self.index[name] = payload
+
+    def load_dict(self, name: str) -> dict:
+        payload = self.index[name]
+        return msgpack.unpackb(payload, raw=False)
+
+    def persist_obj(self, name: str, obj: Any) -> None:
+        self.index[name] = obj
+
+    def load_obj(self, name: str) -> Any:
+        return self.index[name]
+
+    def delete(self, name: str) -> None:
+        if name in self.index:
+            del self.index[name]
+
+    def root_join(self, name: str) -> str:
+        return os.path.join(self.root, name)
+
+    def close(self) -> None:
+        self.index.cache.close()
+
+
+class LeanDiskIndexPersistenceProvider(DiskIndexPersistenceProvider):
+    """Lean-integrated version of DiskIndexPersistenceProvider.
+    Optionally accepts a `cache_provider` to search before fallback loading.
+    """
+
+    def __init__(self, prefix: str, lean_obj_store, cache_provider: Optional[DiskIndexPersistenceProvider] = None):
+        self.lean_obj_store = lean_obj_store
+        self.prefix = prefix
+        self.cache_provider = cache_provider
+        
+        db_path = self._request_path("")
+        super().__init__(db_path)
+
+    def _request_path(self, filename):
+        return self.lean_obj_store.get_file_path(f"{self.prefix}/{filename}")
+
+    def root_join(self, name):
+        return self._request_path(name)
+
+    def load_dict(self, name: str) -> dict:
+        if self.cache_provider:
+            try:
+                return self.cache_provider.load_dict(name)
+            except KeyError:
+                pass
+        return super().load_dict(name)
+
+    def load_obj(self, name: str) -> Any:
+        if self.cache_provider:
+            try:
+                return self.cache_provider.load_obj(name)
+            except KeyError:
+                pass
+        return super().load_obj(name)
+
+    def close(self) -> None:
+        super().close()
+        if self.cache_provider:
+            self.cache_provider.close()

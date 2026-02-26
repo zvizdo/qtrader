@@ -76,7 +76,7 @@ class LeanMarketEnv(BaseMarketEnv):
     def execute_buy_limit(self, symbol, size, price):
         dt = self.get_current_market_datetime()
         op = OrderProperties()
-        op.time_in_force = TimeInForce.good_til_date(dt + timedelta(hours=36))
+        op.time_in_force = TimeInForce.good_til_date(dt + timedelta(minutes=10)) # TimeInForce.good_til_date(dt + timedelta(hours=36))
         self.qcl.limit_order(symbol, size, price, order_properties=op)
 
     def execute_sell_limit(self, symbol, size, price):

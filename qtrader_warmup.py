@@ -3,7 +3,7 @@ Standalone CLI to pre-compute and cache all state provider outputs for the full 
 
 Usage:
     python qtrader_warmup.py
-    python qtrader_warmup.py --date-start 2016-01-01 --date-end 2026-02-01 --workers 6
+    python qtrader_warmup.py --date-start 2016-01-01 --date-end 2026-02-01 --workers 7
     python qtrader_warmup.py --golden-db /path/to/golden_cache.db --chunk-months 4
     python qtrader_warmup.py --date-start 2016-01-01 --date-end 2025-01-01 --workers 6 --chunk-months 1
 """
@@ -21,6 +21,7 @@ from datetime import datetime
 import click
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import diskcache
 
 from lean.commands.backtest import backtest as run_lean_backtest
 from qtrader.rlflow.persistence import PersistenceJSONEncoder
@@ -91,74 +92,63 @@ def run_warmup_chunk(chunk_start, chunk_end, chunk_id):
                 data_provider_historical="Local"
             )
 
-        src_db = storage_dir.joinpath("db.sqlite")
-        if not src_db.exists():
-            return chunk_id, False, f"Expected db.sqlite not found at {src_db}. Check log at {log_path}", None, None
-
-        return chunk_id, True, "Success", src_db, (storage_dir, output_dir)
+        return chunk_id, True, "Success", (storage_dir, output_dir)
     except Exception as e:
-        return chunk_id, False, str(e), None, None
+        return chunk_id, False, str(e), None
 
 
-def merge_db(src_db_path, dest_db_path):
-    dest_conn = sqlite3.connect(dest_db_path, timeout=60.0)
-    dest_conn.execute("PRAGMA journal_mode=WAL;")
-    dest_conn.execute("PRAGMA synchronous=NORMAL;")
-
-    dest_conn.execute(f"ATTACH DATABASE '{src_db_path}' AS src;")
-
-    dest_conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS data (
-            id TEXT PRIMARY KEY,
-            payload BLOB
-        );
-        """
-    )
-
-    dest_conn.execute("INSERT OR REPLACE INTO data SELECT * FROM src.data;")
-    dest_conn.commit()
-
-    dest_conn.execute("DETACH DATABASE src;")
-    dest_conn.close()
+# _merge_db removed in favor of concurrent diskcache.Index caching.
 
 
-def run_warmup_parallel(date_start, date_end, golden_db, chunk_months, workers):
-    golden_db = pathlib.Path(golden_db).resolve()
-    os.makedirs(golden_db.parent, exist_ok=True)
+def run_warmup_parallel(date_start, date_end, golden_cache_dir, chunk_months, workers):
+    golden_cache_dir = pathlib.Path(golden_cache_dir).resolve()
+    os.makedirs(golden_cache_dir, exist_ok=True)
+    os.environ["GOLDEN_CACHE_DIR"] = str(golden_cache_dir)
 
     chunks = generate_chunks(date_start, date_end, chunk_months)
     print(f"Divided date range into {len(chunks)} chunks.")
     print(f"Using {workers} workers.")
 
-    # Sort chunks so progress feels more linear chronologically (optional, but nice)
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(run_warmup_chunk, chunk[0], chunk[1], i): i
-            for i, chunk in enumerate(chunks)
-        }
+    golden_idx = diskcache.Index(str(golden_cache_dir))
+    try:
+        # Sort chunks so progress feels more linear chronologically (optional, but nice)
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(run_warmup_chunk, chunk[0], chunk[1], i): i
+                for i, chunk in enumerate(chunks)
+            }
 
-        with tqdm(total=len(chunks), desc="Processing chunks") as pbar:
-            for fut in as_completed(futures):
-                chunk_id = futures[fut]
-                try:
-                    c_id, success, msg, src_db, dirs_to_clean = fut.result()
-                    if success:
-                        merge_db(src_db, golden_db)
-                        # Clean up the entire warmup storage and trial output for this chunk
-                        storage_dir, output_dir = dirs_to_clean
-                        if storage_dir.exists():
-                            shutil.rmtree(storage_dir, ignore_errors=True)
-                        if output_dir.exists():
-                            shutil.rmtree(output_dir, ignore_errors=True)
-                    else:
-                        print(f"\nChunk {c_id} failed: {msg}")
-                except Exception as e:
-                    print(f"\nChunk {chunk_id} raised an exception: {e}")
-                finally:
-                    pbar.update(1)
+            with tqdm(total=len(chunks), desc="Processing chunks") as pbar:
+                for fut in as_completed(futures):
+                    chunk_id = futures[fut]
+                    try:
+                        c_id, success, msg, dirs_to_clean = fut.result()
+                        if success:
+                            storage_dir, output_dir = dirs_to_clean
+                            
+                            # Merge the chunk's diskcache into the global one sequentially to avoid Docker SQLite locking issues
+                            chunk_idx_path = str(storage_dir)
+                            if os.path.exists(chunk_idx_path):
+                                chunk_idx = diskcache.Index(chunk_idx_path)
+                                for key in chunk_idx:
+                                    golden_idx[key] = chunk_idx[key]
+                                chunk_idx.cache.close()
+                                    
+                            # Clean up the entire warmup storage and trial output for this chunk
+                            if storage_dir.exists():
+                                shutil.rmtree(storage_dir, ignore_errors=True)
+                            if output_dir.exists():
+                                shutil.rmtree(output_dir, ignore_errors=True)
+                        else:
+                            print(f"\nChunk {c_id} failed: {msg}")
+                    except Exception as e:
+                        print(f"\nChunk {chunk_id} raised an exception: {e}")
+                    finally:
+                        pbar.update(1)
+    finally:
+        golden_idx.cache.close()
 
-    print(f"WARMUP complete. Golden cache DB written/merged at: {golden_db}")
+    print(f"WARMUP complete. Golden cache written at: {golden_cache_dir}")
 
 
 if __name__ == "__main__":
@@ -178,10 +168,10 @@ if __name__ == "__main__":
         help="End date (YYYY-MM-DD). Default: 2026-02-01",
     )
     parser.add_argument(
-        "--golden-db",
+        "--golden-cache-dir",
         type=str,
-        default=None,
-        help="Path for the golden cache DB. Default: ../storage/cache/golden_cache.db",
+        default="../storage/cache",
+        help="Directory for the golden diskcache index on the host. Default: ../storage/cache",
     )
     parser.add_argument(
         "--chunk-months",
@@ -204,10 +194,7 @@ if __name__ == "__main__":
     date_start = datetime.fromisoformat(args.date_start)
     date_end = datetime.fromisoformat(args.date_end)
 
-    if args.golden_db is None:
-        proj_path = pathlib.Path(__file__).parent.resolve()
-        golden_db = proj_path.joinpath("../storage/cache/golden_cache.db").resolve()
-    else:
-        golden_db = args.golden_db
+    proj_path = pathlib.Path(__file__).parent.resolve()
+    golden_cache_dir = proj_path.joinpath(args.golden_cache_dir).resolve()
 
-    run_warmup_parallel(date_start, date_end, golden_db, args.chunk_months, args.workers)
+    run_warmup_parallel(date_start, date_end, golden_cache_dir, args.chunk_months, args.workers)

@@ -136,8 +136,9 @@ class PrioritizedReplayBuffer(object):
         min_priority = self._min()
 
         # Draw uniform random values in [0, total) and run vectorized tree lookup
-        rnd = np.random.random(batch_size) * total
+        rnd = np.random.random(batch_size) * total * 0.999999
         indexes = self._find_prefix_sum_idx_batch(rnd)
+        indexes = np.minimum(indexes, self.size - 1)
 
         # $\min_i P(i) = \frac{\min_i p_i^\alpha}{\sum_k p_k^\alpha}$
         prob_min = min_priority / total

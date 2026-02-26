@@ -42,8 +42,8 @@ from datetime import datetime, timedelta
 from qtrader.rlflow.persistence import (
     BasePersistenceProvider,
     NoPersistenceProvider,
-    LeanSQLitePersistenceProvider,
-    LeanCachedSQLitePersistenceProvider,
+    DiskIndexPersistenceProvider,
+    LeanDiskIndexPersistenceProvider
 )
 from qtrader.environments.base import BaseMarketEnv
 from qtrader.environments.lean import LeanMarketEnv
@@ -165,10 +165,20 @@ class QTraderAlgorithm(QCAlgorithm):
         self.subscription_manager.add_consolidator(self.symbol, self._consolidator)
 
         # persistance
-        self.pprovider = LeanCachedSQLitePersistenceProvider(
-            prefix=base_name, lean_obj_store=self.object_store, 
-            cache_size=1_000_000, flush_interval=1024
-        )
+        golden_cache_dir = Path(self.object_store.get_file_path("cache")).resolve()
+        has_cache = golden_cache_dir.exists()
+
+        if run_type == "WARMUP":
+            self.debug(f"{run_type}: Using isolated lean store to avoid Docker volume SQLite concurrency.")
+            self.pprovider = LeanDiskIndexPersistenceProvider(prefix=base_name, lean_obj_store=self.object_store)
+        else:
+            cache_prov = DiskIndexPersistenceProvider(str(golden_cache_dir)) if run_type in ("TRAIN", "EVAL") and has_cache else None
+            msg = f"read-through cache from {golden_cache_dir}" if cache_prov else "isolated lean store"
+            self.debug(f"{run_type}: Using {msg}")
+            self.pprovider = LeanDiskIndexPersistenceProvider(
+                prefix=base_name, lean_obj_store=self.object_store, cache_provider=cache_prov
+            )
+            
         assert isinstance(self.pprovider, BasePersistenceProvider)
 
         # market env
@@ -313,12 +323,6 @@ class QTraderAlgorithm(QCAlgorithm):
         self.p_state_prev = None
         self.p_cache_enabled = True
 
-        # Warm the in-memory cache from SQLite for the iteration's date range
-        if run_type != "WARMUP" and hasattr(self.pprovider, 'warm_cache_for_range'):
-            for sy in self.p_symbols:
-                n = self.pprovider.warm_cache_for_range(sy, date_start, date_end)
-                self.debug(f"Warm cache loaded {n} entries for {sy} [{date_start} → {date_end}]")
-
     def on_data(self, data: Slice):
         """Minute-level tick handler — all logic lives in _on_consolidated_bar."""
         pass
@@ -432,20 +436,15 @@ class QTraderAlgorithm(QCAlgorithm):
         self.debug("{} {}".format(self.time, order_event.to_string()))
 
     def on_end_of_algorithm(self):
-        # flush any buffered persistence writes
-        if hasattr(self.pprovider, 'flush'):
-            self.pprovider.flush()
-
-        if self.p_run_type == "WARMUP":
-            self.pprovider.close()
-            return
-
-        if not self.agent.no_learn:
+        if self.agent and not self.agent.no_learn:
             self.agent.save_config()
             self.agent.save_model(online=True)
             self.agent.save_model(online=False)
 
         self.pprovider.close()
+
+        if self.p_run_type == "WARMUP":
+            return
 
         agent = self.agent
 
