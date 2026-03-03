@@ -20,17 +20,19 @@ def objective(trial):
         iters=500,
         params={
             # ===== STATIC =====
-            "invest_pct": 0.4,
+            "invest_pct": (0.05, 0.5),
+            "eval_invest_pct": 0.25,
             "expl_decay": 0.98,
             "n_steps_warmup": 1024 * 10,
-            "n_step_update": 48, # 96 is once per day
+            "n_step_update": 8, # 96 is once per day
             "model_n_layers": 2,
             "model_fl_size": 128,
             "model_shape": "cone",
-            "exp_memory_size": 365 * 10_000,
-            "exp_mini_batch_size": 32,
+            "exp_memory_size": 365 * 96 * 7 * 2, # 365 * 10_000,
+            "exp_mini_batch_size": 128, 
             "exp_w_inc": 5e-5,
             # ===== TUNED =====
+            # "n_step_update": trial.suggest_categorical("n_step_update", [8, 16, 24]),
             "expl_min": trial.suggest_float("expl_min", 0.01, 0.15, step=0.01),
             "n_steps_checkpoint": trial.suggest_int("n_steps_checkpoint", 500, 5_000, step=250),
             "exp_weighting": trial.suggest_float("exp_weighting", 0.3, 0.7, step=0.05),
@@ -42,7 +44,6 @@ def objective(trial):
         prune=_report_evals,  # {"n_tests": 7, "n_trades": 30},
     )
 
-    # Fix #5 & #6: guard against missing or malformed stats before key access
     try:
         total_perf = stats["totalPerformance"]
         port_stats = total_perf["portfolioStatistics"]
@@ -73,7 +74,7 @@ if __name__ == "__main__":
     pruner = optuna.pruners.PercentilePruner(
         percentile=33.0,         # prune bottom 1/3 of trials
         n_startup_trials=5,      # let first 5 trials run fully (need baseline data)
-        n_warmup_steps=50,       # don't prune any trial before step 50
+        n_warmup_steps=200,       # don't prune any trial before step 200
         n_min_trials=3,          # need ≥3 completed trials at a step to compare
     )
     study = optuna.load_study(study_name=study_name, storage=path, pruner=pruner)

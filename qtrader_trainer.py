@@ -68,7 +68,7 @@ def run_backtest(
                 output=output_path,
                 detach=False,
                 no_update=True,
-                # extra_config=[("log-level", "error")]
+                extra_config=[("storage-limit", "107374182400")]
             )
             last_exc = None
             break
@@ -116,6 +116,17 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
     iter_dir_f = lambda x: trial_dir.joinpath(f"{x}").resolve()
     config_dir_f = lambda x: proj_path.joinpath(f"../storage/{name}/{x}").resolve()
 
+    if not params:
+        import sys
+        params_file = config_dir_f("").joinpath("params.json")
+        if params_file.exists():
+            with open(params_file, "r") as f:
+                loaded_config = json.load(f)
+                params = loaded_config.get("hyperparams", loaded_config)
+        else:
+            print(f"Error: 'params' not passed and '{params_file}' not found.")
+            sys.exit(1)
+
     # --- Training and Evaluation Period Config ---
     train_period_start = datetime(2016, 1, 1)
     train_period_end = datetime(2023, 1, 1) # Approximate 7 years from start
@@ -149,6 +160,11 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
     for i in range(iters):
         # region Run Iteration
         step += 1
+        
+        # Seed by step to guarantee identical random sequences (dates, invest_pct)
+        # across all trials and upon resuming interrupted trials.
+        np.random.seed(42 + step)
+
         pprovider = DiskIndexPersistenceProvider(root=str(config_dir_f("")))
         pprovider.persist_dict(name=TR_INFO__STEP, obj=step)
         pprovider.close()
@@ -156,10 +172,17 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
 
         iter_name = f"Iter{str(step).zfill(6)}"
         run_params["run_type"] = "TRAIN"
+        run_params["seed"] = 42 + step
         run_params["date_start"] = train_period_start + timedelta(
             days=np.random.randint(0, (train_period_end - train_period_start).days - train_sample_duration_days)
         )
         run_params["date_end"] = run_params["date_start"] + timedelta(days=train_sample_duration_days)
+
+        # Handle randomized invest_pct
+        run_params["hyperparams"] = dict(params)
+        base_invest_pct = run_params["hyperparams"].get("invest_pct", 0.05)
+        if hasattr(base_invest_pct, '__iter__') and not isinstance(base_invest_pct, str):
+            run_params["hyperparams"]["invest_pct"] = round(float(np.random.uniform(base_invest_pct[0], base_invest_pct[1])), 2)
 
         stats = run_backtest(
             proj_path, config_dir_f, iter_dir_f, name, iter_name, run_params, True
@@ -189,8 +212,14 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
                 "run_type": "EVAL",
                 "date_start": eval_start,
                 "date_end": eval_end,
+                "seed": 42 + step,
             }
         )
+        
+        # Clamp to evaluation invest_pct
+        run_params["hyperparams"] = dict(params)
+        if "eval_invest_pct" in run_params["hyperparams"]:
+            run_params["hyperparams"]["invest_pct"] = run_params["hyperparams"]["eval_invest_pct"]
         stats = run_backtest(
             proj_path, config_dir_f, iter_dir_f, name, eval_name, run_params, False
         )
@@ -206,8 +235,8 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
                 drawdown = float(port_stats.get("drawdown", 0))
                 num_trades = len(stats.get("orders", {}).keys())
 
-                if num_trades <= 10 or drawdown > 0.5 or sharpe < -1.0:
-                    raise optuna.TrialPruned()
+                # if num_trades <= 10 or drawdown > 0.5 or sharpe < -1.0:
+                #     raise optuna.TrialPruned()
 
             # Percentile-based pruning via Optuna callback
             if prune is not None and callable(prune):

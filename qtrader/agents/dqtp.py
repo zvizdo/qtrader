@@ -102,10 +102,11 @@ class DQTPAgent(BaseAgent):
         self.no_full_state = no_full_state
 
         self.learn_timer = dict()
-        self.td_tracker, self.td_tracker_n = 0, 0
+        self.td_tracker, self.td_rb_max_priority, self.td_tracker_n = 0, 0, 0
         self.loss_tracker, self.loss_tracker_n = 0.0, 0
-        self.q_value_tracker, self.q_value_tracker_n = 0.0, 0
+        self.q_value_tracker, self.q_value_diff_tracker, self.q_value_tracker_n = 0.0, 0, 0
         self.reward_tracker, self.reward_tracker_n = 0.0, 0
+        self.market_log_change_tracker, self.market_log_change_tracker_n = 0.0, 0
 
     def load_config(self):
         try:
@@ -120,8 +121,8 @@ class DQTPAgent(BaseAgent):
             with open(path, "rb") as f:
                 self.rb = pickle.load(f)
 
-        except:
-            pass
+        except Exception as e:
+            print(f"FAILED TO LOAD CONFIG OR REPLAY BUFFER: {e}")
 
     def save_config(self):
         self.pprovider.persist_dict(
@@ -135,8 +136,19 @@ class DQTPAgent(BaseAgent):
             },
         )
         path = self.pprovider.root_join(self.rb_prefix)
-        with open(path, "wb") as f:
-            pickle.dump(self.rb, f, protocol=pickle.HIGHEST_PROTOCOL)
+        path_tmp = f"{path}.tmp"
+        
+        try:
+            with open(path_tmp, "wb") as f:
+                pickle.dump(self.rb, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                import os
+                os.fsync(f.fileno())
+                
+            import os
+            os.replace(path_tmp, path)
+        except Exception as e:
+            print(f"FAILED TO SAVE REPLAY BUFFER: {e}")
 
     def _possible_actions(self, symbol: str, state: dict):
         return np.ones(len(self.ACTIONS))
@@ -232,6 +244,8 @@ class DQTPAgent(BaseAgent):
             price_current = state["state_symbol"][sy]["ohlcv"]["close"][-1]
             price_future = state_future["state_symbol"][sy]["ohlcv"]["close"][-1]
             reward[sy]["market_log_return"] = np.log(price_future / price_current)
+            self.market_log_change_tracker += reward[sy]["market_log_return"]
+            self.market_log_change_tracker_n += 1
 
             # Days in current trade (for holding penalty)
             trade = state["state_symbol"][sy]["trade"]
@@ -285,6 +299,7 @@ class DQTPAgent(BaseAgent):
 
         if (
             self.n_steps > self.n_steps_warmup
+            and self.rb.size >= self.exp_mini_batch_size
             and self.n_steps % self.n_step_update == 0
         ):
             self.exp_weighting = min(1.0, self.exp_weighting + self.exp_w_inc)
@@ -492,6 +507,7 @@ class DQTPAgent(BaseAgent):
 
         # Track mean Q-value across the batch
         self.q_value_tracker += q_values.mean()
+        self.q_value_diff_tracker += np.ptp(q_values, axis=1).mean()
         self.q_value_tracker_n += 1
         q_values_future[pa == 0] = -np.inf
         q_f_action_index = np.argmax(q_values_future, axis=1)
@@ -502,7 +518,7 @@ class DQTPAgent(BaseAgent):
         q_t_t = q_values_future_t[rws, q_f_action_index]
         q_a_t = reward + self.rl_gamma * q_t_t
 
-        tds = np.abs(q_a_t - q_a) + 1e-6
+        tds = np.clip(np.abs(q_a_t - q_a), 0.0, 1.0) + 1e-6 # np.abs(q_a_t - q_a) + 1e-6
         q[a_index] = q_a_t
         y = q
 
@@ -535,6 +551,7 @@ class DQTPAgent(BaseAgent):
             print(f"EXCEPTION model_online.fit: {e}")
 
         self.td_tracker += tds.mean()
+        self.td_rb_max_priority += self.rb.max_priority
         self.td_tracker_n += 1
 
         self.learn_timer["model_fit"] = round(tm.time() - st, 3)

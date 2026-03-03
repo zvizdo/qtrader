@@ -1,25 +1,3 @@
-# region Set random seeds
-seed_value = 42
-# 1. Set the `PYTHONHASHSEED` environment variable at a fixed value
-import os
-
-os.environ["PYTHONHASHSEED"] = str(seed_value)
-
-# 2. Set the `python` built-in pseudo-random generator at a fixed value
-import random
-
-random.seed(seed_value)
-
-# 3. Set the `numpy` pseudo-random generator at a fixed value
-import numpy as np
-
-np.random.seed(seed_value)
-
-# 4. Set the `tensorflow` pseudo-random generator at a fixed value
-import tensorflow as tf
-
-tf.random.set_seed(seed_value)
-# endregion
 
 # region Imports
 from QuantConnect.Indicators import RollingWindow
@@ -37,6 +15,9 @@ from AlgorithmImports import (
 )
 
 import json
+import random
+import numpy as np
+import tensorflow as tf
 from pathlib import Path
 from datetime import datetime, timedelta
 from qtrader.rlflow.persistence import (
@@ -97,7 +78,7 @@ class QTraderAlgorithm(QCAlgorithm):
             expl_max=1,
             expl_min=float(params.get("expl_min", 0.01)),
             expl_decay=float(params.get("expl_decay", 0.9995)),
-            invest_pct=0.05,
+            invest_pct=float(params.get("invest_pct", 0.05)),
             n_steps_warmup=int(params.get("n_steps_warmup", 1024)),
             n_step_update=int(params.get("n_step_update", 4)),
             n_steps_checkpoint=int(params.get("n_steps_checkpoint", 5000)),
@@ -125,6 +106,11 @@ class QTraderAlgorithm(QCAlgorithm):
         run_params = self._load_run_params()
         base_name = self.name.split("/")[0]
         self.debug(run_params)
+
+        seed_value = run_params.get("seed", 42)
+        random.seed(seed_value)
+        np.random.seed(seed_value)
+        tf.random.set_seed(seed_value)
 
         run_type = "LIVE" if self.live_mode else run_params.get("run_type", "TRAIN")
         date_start = datetime.fromisoformat(run_params.get("date_start", "2018-04-05"))
@@ -454,6 +440,11 @@ class QTraderAlgorithm(QCAlgorithm):
                 "mean_td_error", agent.td_tracker / agent.td_tracker_n
             )
 
+        # if hasattr(agent, "td_rb_max_priority") and agent.td_rb_max_priority > 0:
+        #     self.set_summary_statistic(
+        #         "mean_td_max_priority", agent.td_rb_max_priority / agent.td_tracker_n
+        #     )
+
         if hasattr(agent, "loss_tracker_n") and agent.loss_tracker_n > 0:
             self.set_summary_statistic(
                 "mean_loss", agent.loss_tracker / agent.loss_tracker_n
@@ -464,22 +455,32 @@ class QTraderAlgorithm(QCAlgorithm):
                 "mean_q_value", agent.q_value_tracker / agent.q_value_tracker_n
             )
 
+        if hasattr(agent, "q_value_diff_tracker") and agent.q_value_tracker_n > 0:
+            self.set_summary_statistic(
+                "mean_q_value_diff", agent.q_value_diff_tracker / agent.q_value_tracker_n
+            )
+
         # -- Reward metrics --
         if hasattr(agent, "reward_tracker_n") and agent.reward_tracker_n > 0:
             self.set_summary_statistic(
                 "mean_shaped_reward", agent.reward_tracker / agent.reward_tracker_n
             )
 
-        if self.task_feedback.num_feedbacks > 0:
+        # if self.task_feedback.num_feedbacks > 0:
+        #     self.set_summary_statistic(
+        #         "mean_portfolio_change",
+        #         self.task_feedback.ttl_reward / self.task_feedback.num_feedbacks,
+        #     )
+
+        if hasattr(agent, "market_log_change_tracker_n") and agent.market_log_change_tracker_n > 0:
             self.set_summary_statistic(
-                "mean_portfolio_change",
-                self.task_feedback.ttl_reward / self.task_feedback.num_feedbacks,
+                "mean_market_log_change", agent.market_log_change_tracker / agent.market_log_change_tracker_n
             )
 
         # -- Agent state --
         self.set_summary_statistic("exploration_rate", agent.expl_rate)
-        self.set_summary_statistic("n_updates", agent.n_updates)
-        self.set_summary_statistic("replay_buffer_size", agent.rb.size)
+        # self.set_summary_statistic("n_updates", agent.n_updates)
+        # self.set_summary_statistic("replay_buffer_size", agent.rb.size)
 
         self.log(
             "{} - TotalPortfolioValue: {}".format(

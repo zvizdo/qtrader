@@ -46,6 +46,6 @@ class FeedbackTask(BaseTask):
                 f"Portfolio Change: {round(reward[sy]['v_po_change'], 4)}%"
             )
 
-        self.ttl_reward += sum([reward[sy]["v_po_change"] for sy in symbols])
-        self.num_feedbacks += 1
+        # self.ttl_reward += sum([reward[sy]["v_po_change"] for sy in symbols])
+        # self.num_feedbacks += 1
         agent.feedback(state_prev, state_prev["action"], reward, state)

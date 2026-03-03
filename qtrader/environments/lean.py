@@ -22,7 +22,20 @@ class LeanMarketEnv(BaseMarketEnv):
     # START: LeanMarketEnv
 
     def get_current_market_datetime(self):
-        return self.qcl.time  # self.qcl.utc_time.replace(tzinfo=None)
+        dt = self.qcl.time
+        
+        # Snap to perfectly align with bar period (e.g. 15m) to prevent cache misses 
+        # caused by slightly offset triggers like 00:01
+        minutes_period = int(self.bar_period.total_seconds() / 60.0)
+        m_total = dt.hour * 60 + dt.minute
+        snapped_m_total = (m_total // minutes_period) * minutes_period
+        
+        return dt.replace(
+            hour=(snapped_m_total // 60),
+            minute=(snapped_m_total % 60),
+            second=0,
+            microsecond=0
+        )
 
     def get_account_value(self):
         return self.qcl.portfolio.total_portfolio_value

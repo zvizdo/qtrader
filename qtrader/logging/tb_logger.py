@@ -43,11 +43,13 @@ class TrainingLogger:
             - mean_td_error
             - mean_portfolio_change   (renamed from mean_reward)
             - mean_shaped_reward      (actual DQN training reward)
+            - mean_market_log_change
             - exploration_rate
             - n_updates
             - replay_buffer_size
             - mean_loss
             - mean_q_value
+            - mean_q_value_diff
         """
         s = stats.get("statistics", {})
         perf = stats.get("totalPerformance", {})
@@ -56,10 +58,14 @@ class TrainingLogger:
             # -- Core DQN convergence signals --
             if "mean_td_error" in s:
                 tf.summary.scalar("train/mean_td_error", float(s["mean_td_error"]))
+            if "mean_td_max_priority" in s:
+                tf.summary.scalar("train/mean_td_max_priority", float(s["mean_td_max_priority"]))
             if "mean_loss" in s:
                 tf.summary.scalar("train/mean_loss", float(s["mean_loss"]))
             if "mean_q_value" in s:
                 tf.summary.scalar("train/mean_q_value", float(s["mean_q_value"]))
+            if "mean_q_value_diff" in s:
+                tf.summary.scalar("train/mean_q_value_diff", float(s["mean_q_value_diff"]))
 
             # -- Reward signals --
             if "mean_shaped_reward" in s:
@@ -69,6 +75,10 @@ class TrainingLogger:
             if "mean_portfolio_change" in s:
                 tf.summary.scalar(
                     "train/mean_portfolio_change", float(s["mean_portfolio_change"])
+                )
+            if "mean_market_log_change" in s:
+                tf.summary.scalar(
+                    "train/mean_market_log_change", float(s["mean_market_log_change"])
                 )
 
             # -- Agent state --

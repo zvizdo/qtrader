@@ -9,7 +9,11 @@ class PrioritizedReplayBuffer(object):
         ### Initialize
         """
         # We use a power of $2$ for capacity because it simplifies the code and debugging
-        self.capacity = capacity
+        self.max_capacity = capacity
+        c = 1
+        while c < capacity:
+            c *= 2
+        self.capacity = c
         # $\alpha$
         self.alpha = alpha
 
@@ -42,9 +46,9 @@ class PrioritizedReplayBuffer(object):
         self.data[idx] = state
 
         # Increment next available slot
-        self.next_idx = (idx + 1) % self.capacity
+        self.next_idx = (idx + 1) % self.max_capacity
         # Calculate the size
-        self.size = min(self.capacity, self.size + 1)
+        self.size = min(self.max_capacity, self.size + 1)
 
         # $p_i^\alpha$, new samples get `max_priority`
         priority_alpha = (
@@ -176,4 +180,4 @@ class PrioritizedReplayBuffer(object):
         """
         ### Whether the buffer is full
         """
-        return self.capacity == self.size
+        return self.max_capacity == self.size
