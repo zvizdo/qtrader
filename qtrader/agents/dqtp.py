@@ -33,7 +33,7 @@ class DQTPAgent(BaseAgent):
         n_steps_warmup=1000,
         n_step_update=10,
         n_steps_checkpoint=1000,
-        target_tau=0.005,
+        target_tau=0.001,
         exp_memory_size=365,
         exp_mini_batch_size=128,
         exp_weighting=0.4,
@@ -414,13 +414,13 @@ class DQTPAgent(BaseAgent):
                   - P(t) * alpha_step * (exp(days_in_trade / tau_days) - 1)
 
         Net_Return   = (market_log_return - comm_frac) * scale
-        scale        = 960 (10 * 96 bars/day)
+        scale        = 150 (targets 90% of rewards in [-1, 1] for BTC 15m σ≈0.004)
         tau_days     = 14.0 (time constant in days)
-        alpha_step   = 0.002 / 96 (daily alpha spread across 96 intraday steps)
+        alpha_step   = 0.01 (rescaled to be meaningful vs ±1 rewards)
         """
-        scale = 960
+        scale = 150
         tau_days = 14.0
-        alpha_step = 0.002 / 96.0
+        alpha_step = 0.01
 
         def _compute_single_reward(re):
             p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
@@ -517,8 +517,9 @@ class DQTPAgent(BaseAgent):
         )
         q_t_t = q_values_future_t[rws, q_f_action_index]
         q_a_t = reward + self.rl_gamma * q_t_t
+        q_a_t = np.clip(q_a_t, -15.0, 15.0)
 
-        tds = np.clip(np.abs(q_a_t - q_a), 0.0, 1.0) + 1e-6 # np.abs(q_a_t - q_a) + 1e-6
+        tds = np.clip(np.abs(q_a_t - q_a), 0.0, 5.0) + 1e-6 # np.abs(q_a_t - q_a) + 1e-6
         q[a_index] = q_a_t
         y = q
 

@@ -166,8 +166,11 @@ class PrioritizedReplayBuffer(object):
         # Clip to a minimum epsilon so no sample is permanently starved
         priorities = np.maximum(priorities, MIN_PRIORITY)
 
-        # Batch max-priority update
-        self.max_priority = max(self.max_priority, priorities.max())
+        # Soft-decay max_priority toward actual observed priorities
+        self.max_priority = max(
+            priorities.max(),
+            self.max_priority * 0.999
+        )
 
         for idx, priority in zip(indexes, priorities):
             # Calculate $p_i^\alpha$
