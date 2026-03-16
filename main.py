@@ -13,6 +13,7 @@ from AlgorithmImports import (
     TradeBarConsolidator,
     TradeBar,
 )
+from QuantConnect.Orders.Fills import LatestPriceFillModel
 
 import json
 import random
@@ -98,6 +99,9 @@ class QTraderAlgorithm(QCAlgorithm):
                 for i in range(model_n_layers)
             ],  # model related
             rl_gamma=float(params.get("rl_gamma", 0.9)),
+            target_tau=float(params.get("target_tau", 0.001)),
+            reward_type=str(params.get("reward_type", "sign")),
+            flat_penalty_mult=float(params.get("flat_penalty_mult", -2.0)),
         )
 
         return agent
@@ -128,6 +132,7 @@ class QTraderAlgorithm(QCAlgorithm):
         )
 
         self.exchange = self.add_crypto("BTCUSD", Resolution.MINUTE)
+        self.exchange.set_fill_model(LatestPriceFillModel())
         self.symbol = self.exchange.symbol
         self.set_time_zone(self.exchange.exchange.time_zone)
 

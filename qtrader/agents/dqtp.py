@@ -44,6 +44,8 @@ class DQTPAgent(BaseAgent):
         model_layers=[32],
         model_act_func="elu",  # model related
         rl_gamma=0.9,
+        reward_type="clipped",  # "sign", "clipped", or "adaptive"
+        flat_penalty_mult=-2.0,
         no_learn=False,
         no_full_state=True,
     ):
@@ -77,6 +79,8 @@ class DQTPAgent(BaseAgent):
         self.model_act_func = model_act_func
 
         self.rl_gamma = rl_gamma
+        self.reward_type = reward_type
+        self.flat_penalty_mult = flat_penalty_mult
 
         self.model_name = "QAgent-Model-{}.keras"
         self.model_online = None
@@ -185,9 +189,12 @@ class DQTPAgent(BaseAgent):
             if self.model_online is None or (
                 not self.no_learn and np.random.rand() < self.expl_rate
             ):
-                # create random action
-                p = np.random.rand(len(self.ACTIONS)) * pa
-                ai = np.argmax(p)
+                # create random action — biased 70% LONG / 30% FLAT
+                # to generate longer holds during exploration and reduce
+                # fee drag from frequent random transitions
+                exploration_bias = np.array([0.3, 0.7]) * pa
+                exploration_bias /= exploration_bias.sum()
+                ai = np.random.choice(len(self.ACTIONS), p=exploration_bias)
                 a = self.ACTIONS[ai]
                 actions[sy] = {
                     "action_private": a,
@@ -247,31 +254,28 @@ class DQTPAgent(BaseAgent):
             self.market_log_change_tracker += reward[sy]["market_log_return"]
             self.market_log_change_tracker_n += 1
 
-            # Days in current trade (for holding penalty)
-            trade = state["state_symbol"][sy]["trade"]
-            cdt = to_dt(state["state_global"]["account"]["current_datetime"])
-            if pos_prev and trade:
-                days_in_trade = (
-                    cdt - to_dt(trade[0]["datetime"])
-                ).total_seconds() / 86400.0
-            else:
-                days_in_trade = 0.0
-            reward[sy]["days_in_trade"] = days_in_trade
-
-            # Real commission as fraction of account value
-            # If a position change occurred, the triggering order is the last
-            # order in state_future's trade data (it was filled between state
-            # and state_future).  When no trade fires, comm_frac is 0.
+            # Commission as fraction of position notional
             p_t = 1.0 if action[sy]["action_private"] == self.ACTION_LONG else 0.0
             p_t_prev = reward[sy]["position_prev_indicator"]
             account_value = state["state_global"]["account"]["value"]
+            position_notional = account_value * self.invest_pct
             comm_frac = 0.0
             if abs(p_t - p_t_prev) > 0.5:
                 trade_future = state_future["state_symbol"][sy]["trade"]
                 if trade_future:
                     last_order = trade_future[-1]
-                    comm_frac = last_order.get("comm", 0.0) / (account_value + 1e-8)
+                    comm_frac = last_order.get("comm", 0.0) / (position_notional + 1e-8)
             reward[sy]["comm_frac"] = comm_frac
+
+            # Adaptive scale factor (rolling 24h volatility normalization)
+            closes = state["state_symbol"][sy]["ohlcv"]["close"]
+            if len(closes) >= 97:
+                recent_rets = np.diff(np.log(closes[-97:]))
+                rolling_vol = np.std(recent_rets)
+            else:
+                rolling_vol = 0.004
+            vol_ratio = min(rolling_vol / (0.004 + 1e-8), 5.0)
+            reward[sy]["adaptive_scale"] = 150.0 / (0.5 + 0.5 * vol_ratio)
 
         # update state
         state["reward"] = reward
@@ -356,10 +360,11 @@ class DQTPAgent(BaseAgent):
         if not pos:
             ex.append(0.0)
         else:
-            return_on_current_equity = pos["profit"] / (account_value + 1e-8)
+            cost_basis = pos["value"] - pos["profit"]
+            return_on_position = pos["profit"] / (cost_basis + 1e-8)
             ex.append(
-                math.copysign(1.0, return_on_current_equity)
-                * math.log1p(100 * abs(return_on_current_equity))
+                math.copysign(1.0, return_on_position)
+                * math.log1p(100 * abs(return_on_position))
             )
 
         ex.append(0.0 if not pos else math.log1p(len(trade)))
@@ -386,6 +391,21 @@ class DQTPAgent(BaseAgent):
         ex.append((1.0 - cs_high / price) / vol)
         ex.append((1.0 - cs_low / price) / vol)
 
+        # ── CANDLE BODY RATIO (1 feature) ──
+        full_range = cs_high - cs_low + 1e-8
+        ex.append(abs(price - cs_open) / full_range)
+
+        # ── LOG-RETURNS (3 features) ──
+        closes = ohlcv["close"]
+        for i in self._LOOKBACKS:
+            ex.append(math.log(closes[-1] / (closes[-1 - i] + 1e-8)) * 100)
+
+        # ── RELATIVE VOLUME (3 features) ──
+        volumes = ohlcv["volume"]
+        vol_mean = np.mean(volumes[-16:]) + 1e-8
+        for i in self._LOOKBACKS:
+            ex.append(math.log1p(volumes[-i] / vol_mean))
+
         # ── BRIDGE BANDS × 3 scales (9 features each = 27 total) ──
         for bb_key in self._BB_KEYS:
             bb = sym_state[bb_key]
@@ -396,6 +416,11 @@ class DQTPAgent(BaseAgent):
                 ex.append(bb_w[-i])
                 ex.append(bb_pos[-i])
                 ex.append(bb_hexp[-i])
+
+        # ── BB POSITION VELOCITY (3 features) ──
+        for bb_key in self._BB_KEYS:
+            bb_pos = sym_state[bb_key]["bridge_bands_pos"]
+            ex.append(bb_pos[-1] - bb_pos[-4])
 
         # ── MACD × 3 scales (6 features each = 18 total) ──
         for macd_key in self._MACD_KEYS:
@@ -408,33 +433,50 @@ class DQTPAgent(BaseAgent):
 
         return ex
 
+    _REWARD_SCALE = 150.0  # targets ~90% of rewards in [-1, 1] for BTC 15m σ≈0.004
+
     def _generate_reward(self, rewards):
         """
-        Reward(t) = P(t) * Net_Return
-                  - P(t) * alpha_step * (exp(days_in_trade / tau_days) - 1)
+        Reward dispatcher — selected by self.reward_type.
 
-        Net_Return   = (market_log_return - comm_frac) * scale
-        scale        = 150 (targets 90% of rewards in [-1, 1] for BTC 15m σ≈0.004)
-        tau_days     = 14.0 (time constant in days)
-        alpha_step   = 0.01 (rescaled to be meaningful vs ±1 rewards)
+        "sign"     — Binary: LONG+up=+1, LONG+down=-1, FLAT=-0.2
+        "clipped"  — clip(log_ret × 150, -1, 1) when LONG, 0 when FLAT
+        "adaptive" — log_ret × adaptive_scale when LONG, 0 when FLAT
+
+        All variants subtract real trade cost (comm_frac) on position changes.
         """
-        scale = 150
-        tau_days = 14.0
-        alpha_step = 0.01
+        compute = getattr(self, f"_reward_{self.reward_type}", None)
+        if compute is None:
+            raise ValueError(f"Unknown reward_type: {self.reward_type!r}. "
+                             f"Must be 'sign', 'clipped', or 'adaptive'.")
+        return np.array([compute(re) for re in rewards])
 
-        def _compute_single_reward(re):
-            p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
-            raw_return = re.get("market_log_return", 0.0)
-            comm_frac = re.get("comm_frac", 0.0)
-            days_in_trade = re.get("days_in_trade", 0.0)
+    def _reward_sign(self, re):
+        """LONG+up → +1, LONG+down → -1, FLAT → -0.2, trade cost on change."""
+        p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
+        direction = 1.0 if re.get("market_log_return", 0.0) > 0 else -1.0
+        trade_cost = re.get("comm_frac", 0.0) * self._REWARD_SCALE
+        flat_penalty = -2.0 * (1.0 - self.rl_gamma)
+        return p_t * direction - trade_cost + (1.0 - p_t) * flat_penalty
 
-            net_return = (raw_return - comm_frac) * scale
-            holding_penalty = p_t * alpha_step * (np.exp(days_in_trade / tau_days) - 1)
+    def _reward_clipped(self, re):
+        """clip(log_ret × 150, -1, 1) when LONG, 0 when FLAT."""
+        p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
+        market_return = np.clip(
+            re.get("market_log_return", 0.0) * self._REWARD_SCALE, -1.0, 1.0
+        )
+        trade_cost = re.get("comm_frac", 0.0) * self._REWARD_SCALE
+        flat_penalty = self.flat_penalty_mult * (1.0 - self.rl_gamma) # -2.0 * (1.0 - self.rl_gamma)
+        return p_t * market_return - trade_cost + (1.0 - p_t) * flat_penalty
 
-            return p_t * net_return - holding_penalty
-
-        r = np.array([_compute_single_reward(re) for re in rewards])
-        return r
+    def _reward_adaptive(self, re):
+        """log_ret × adaptive_scale when LONG, 0 when FLAT."""
+        p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
+        adaptive_s = re.get("adaptive_scale", self._REWARD_SCALE)
+        market_return = re.get("market_log_return", 0.0) * adaptive_s
+        trade_cost = re.get("comm_frac", 0.0) * adaptive_s
+        flat_penalty = -2.0 * (1.0 - self.rl_gamma)
+        return p_t * market_return - trade_cost + (1.0 - p_t) * flat_penalty
 
     def _generate_examples_from_state(self, sf) -> Optional[tuple]:
         state = self.pprovider.load_dict(name=sf) if not isinstance(sf, dict) else sf
@@ -517,7 +559,9 @@ class DQTPAgent(BaseAgent):
         )
         q_t_t = q_values_future_t[rws, q_f_action_index]
         q_a_t = reward + self.rl_gamma * q_t_t
-        q_a_t = np.clip(q_a_t, -15.0, 15.0)
+        # q_a_t = np.clip(q_a_t, -15.0, 15.0)
+        q_clip = 1.5 / (1.0 - self.rl_gamma)
+        q_a_t = np.clip(q_a_t, -q_clip, q_clip)
 
         tds = np.clip(np.abs(q_a_t - q_a), 0.0, 5.0) + 1e-6 # np.abs(q_a_t - q_a) + 1e-6
         q[a_index] = q_a_t
@@ -571,11 +615,11 @@ class DQTPAgent(BaseAgent):
                     l,  # input_shape=(input_size,) if n == 0 else None,
                     activation=self.model_act_func,  # "sigmoid",  # "relu",
                     kernel_initializer=ki,
-                    kernel_regularizer=(
-                        tf.keras.regularizers.l2(self.model_l2_reg)
-                        if self.model_l2_reg > 0
-                        else None
-                    ),
+                    # kernel_regularizer=(
+                    #     tf.keras.regularizers.l2(self.model_l2_reg)
+                    #     if self.model_l2_reg > 0
+                    #     else None
+                    # ),
                 )
             )
 
@@ -583,10 +627,10 @@ class DQTPAgent(BaseAgent):
 
         m = tf.keras.Sequential(layers)
         m.compile(
-            loss=tf.keras.losses.Huber(),  # "mse",  # "mse",  # tf.keras.losses.Huber(),
+            loss=tf.keras.losses.Huber(delta=2.0),  # "mse",  # "mse",  # tf.keras.losses.Huber(),
             optimizer=tf.keras.optimizers.Adam(
                 learning_rate=self.model_lr,
-                clipnorm=1.0
+                # clipnorm=1.0
             ),
         )
 

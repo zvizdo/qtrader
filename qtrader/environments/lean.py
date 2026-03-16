@@ -17,7 +17,7 @@ class LeanMarketEnv(BaseMarketEnv):
         self.pprovider = pprovider
         self.bar_period = bar_period
         self.verbose = verbose
-        self._comm_cache = {}  # order_id -> commission (filled orders don't change)
+        self._order_cache = {}  # order_id -> {"comm": float, "fill_price": float}
 
     # START: LeanMarketEnv
 
@@ -114,27 +114,37 @@ class LeanMarketEnv(BaseMarketEnv):
         def map_order(o):
             fill_time = o.last_fill_time.replace(tzinfo=None)
 
-            # Extract actual commission, cached per order ID
-            if o.id not in self._comm_cache:
+            # Extract fill price and commission from order events, cached per order ID
+            if o.id not in self._order_cache:
                 comm = 0.0
+                fill_price = 0.0
+                total_qty = 0.0
                 try:
                     ticket = self.qcl.transactions.get_order_ticket(o.id)
                     for evt in ticket.order_events:
                         comm += abs(float(evt.order_fee.value.amount))
+                        if evt.fill_quantity != 0:
+                            qty = abs(float(evt.fill_quantity))
+                            fill_price += float(evt.fill_price) * qty
+                            total_qty += qty
                 except Exception:
                     pass
-                self._comm_cache[o.id] = comm
+                self._order_cache[o.id] = {
+                    "comm": comm,
+                    "fill_price": fill_price / total_qty if total_qty > 0 else 0.0,
+                }
 
+            cached = self._order_cache[o.id]
             return {
                 "id": o.id,
                 "symbol": symbol,
                 "ts": fill_time.isoformat(),
                 "datetime": fill_time.isoformat(),
-                "price": o.price,
+                "price": cached["fill_price"],
                 "size": o.absolute_quantity,
                 "instruction": "BUY" if o.quantity > 0 else "SELL",
                 "size_instruction": o.quantity,
-                "comm": self._comm_cache[o.id],
+                "comm": cached["comm"],
             }
 
         sy = self.qcl.portfolio[symbol].symbol

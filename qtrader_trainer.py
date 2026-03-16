@@ -5,7 +5,7 @@ np.random.seed(42)
 import time
 import os, shutil, pathlib
 import argparse
-
+import ast
 import click
 import json
 import optuna
@@ -25,8 +25,16 @@ class ParseKwargs(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, dict())
         for value in values:
-            key, value = value.split("=")
-            getattr(namespace, self.dest)[key] = value
+            key, val_str = value.split("=")
+            
+            try:
+                # Safely evaluate strings into numbers, tuples, or booleans
+                parsed_val = ast.literal_eval(val_str)
+            except (ValueError, SyntaxError):
+                # Fall back to keeping it as a string (e.g., for "flat")
+                parsed_val = val_str
+                
+            getattr(namespace, self.dest)[key] = parsed_val
 
 
 def dump_params(config_dir_f, run_params, run_name=""):

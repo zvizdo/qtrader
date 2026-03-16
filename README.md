@@ -30,35 +30,43 @@ A deep Q-learning trading agent for Bitcoin (BTCUSD) built on top of QuantConnec
 
 ## Architecture Overview
 
+At the top level, an **Optuna study** searches over hyperparameters. Each trial spins up a **trainer** that runs hundreds of LEAN backtests — every backtest is a full episode where the agent observes 15-minute bars, decides to go long or stay flat, and learns from the outcome via experience replay. Between episodes, the trainer samples random date windows, decays exploration, and periodically evaluates on a held-out period.
+
+Inside each backtest the heavy lifting happens in four stages that fire on every consolidated bar: **state providers** (Bridge Bands, MACD, OHLCV, volume, position & account features) produce a 70-dim observation → the **DQTP agent** picks an action via ε-greedy Double DQN → the **feedback module** computes a shaped reward from log-returns and a holding penalty → the **learning step** samples a prioritized mini-batch and updates the online network. A pre-computed **golden cache** (diskcache.Index) ensures indicator values are calculated only once across all runs.
+
 ```
-┌─────────────────────────────────────────┐
-│   Optimization Layer                    │
-│   qtrader_optimize.py  (Optuna)         │
-│       └── qtrader_trainer.py            │
-│               └── N training iterations │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────┐
-│   QuantConnect LEAN Backtest Engine     │
-│   main.py :: QTraderAlgorithm           │
-│                                         │
-│   ┌───────────┐    ┌─────────────────┐  │
-│   │ Market Env│───▶│  RL Pipeline    │  │
-│   │ (OHLCV)   │    │ State → Act →   │  │
-│   └───────────┘    │ Feedback → Learn│  │
-│                    └────────┬────────┘  │
-│                             │           │
-│                    ┌────────▼────────┐  │
-│                    │ State Providers │  │
-│                    │ (Indicators)    │  │
-│                    └────────┬────────┘  │
-│                             │           │
-│                    ┌────────▼────────┐  │
-│                    │ SQLite + Cache  │  │
-│                    │ (Golden Cache)  │  │
-│                    └────────────────┘  │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  Optimization Layer                          │
+│  qtrader_optimize.py  (Optuna HPO)           │
+│      └── qtrader_trainer.py                  │
+│              └── N episodes (LEAN backtests)  │
+└───────────────┬──────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────┐
+│  QuantConnect LEAN Backtest Engine           │
+│  main.py :: QTraderAlgorithm                 │
+│                                              │
+│  ┌────────────┐   ┌───────────────────────┐  │
+│  │ Market Env │──▶│  RL Pipeline          │  │
+│  │ (15m OHLCV)│   │  State → Act →        │  │
+│  └────────────┘   │  Feedback → Learn     │  │
+│                   └──────────┬────────────┘  │
+│                              │               │
+│          ┌───────────────────┼────────┐      │
+│          │                   │        │      │
+│  ┌───────▼───────┐  ┌───────▼─────┐  │      │
+│  │ State         │  │ DQTP Agent  │  │      │
+│  │ Providers     │  │ Double DQN  │  │      │
+│  │ (BB, MACD,    │  │ + Prioritized│ │      │
+│  │  OHLCV, Pos)  │  │   Replay    │  │      │
+│  └───────┬───────┘  └─────────────┘  │      │
+│          │                           │      │
+│  ┌───────▼───────────────────────────▼──┐   │
+│  │ diskcache.Index  (Golden Cache)      │   │
+│  │ + LEAN Object Store                  │   │
+│  └──────────────────────────────────────┘   │
+└──────────────────────────────────────────────┘
 ```
 
 ---
@@ -98,7 +106,7 @@ qtrader/
 │   │   ├── action.py           # Action execution
 │   │   ├── feedback.py         # Reward calculation
 │   │   ├── learn.py            # Learning coordination
-│   │   └── persistence.py      # SQLite persistence + caching layer
+│   │   └── persistence.py      # diskcache.Index persistence + caching layer
 │   │
 │   ├── logging/
 │   │   └── tb_logger.py        # TensorBoard logger
@@ -155,10 +163,10 @@ Before training, pre-compute all indicator values across the full historical dat
 python qtrader_warmup.py \
     --date-start 2016-01-01 \
     --date-end 2026-02-01 \
-    --golden-db ../storage/cache/golden_cache.db
+    --golden-cache-dir ../storage/cache
 ```
 
-This runs `main.py` in `WARMUP` mode — it walks through every 15-minute bar, computes all state providers (Bridge Bands, MACD, OHLCV features), and writes the results to a SQLite database (`golden_cache.db`).
+This runs `main.py` in `WARMUP` mode — it walks through every 15-minute bar, computes all state providers (Bridge Bands, MACD, OHLCV features), and writes the results to a `diskcache.Index` directory. The date range is split into chunks and processed in parallel via separate Docker containers, then merged into a single index.
 
 **What gets cached:**
 
@@ -169,7 +177,7 @@ This runs `main.py` in `WARMUP` mode — it walks through every 15-minute bar, c
 
 **Cache key format:** `Flow-State-{symbol}-{YYYYMMDDHHMM}-{ProviderClass}-{ParamsHash}`
 
-Once generated, this file is reused by every training iteration.
+Once generated, this directory is reused as a read-through cache by every training and evaluation iteration.
 
 ### 2. Train the Agent
 
@@ -185,10 +193,9 @@ python qtrader_trainer.py \
 **What happens per iteration:**
 
 1. A random 3-year date window is sampled from the historical data
-2. The golden cache is copied into the iteration's storage directory
-3. The in-memory cache is warmed for the selected date range
-4. LEAN runs a backtest (`main.py` in `TRAIN` mode) — the agent observes 15-minute bars, takes actions, and learns via experience replay
-5. Every `n_test` iterations (default 5), an evaluation run executes on a held-out period (2023-02-01 to 2026-01-31) with frozen weights
+2. The golden cache directory is mounted as a read-through cache provider
+3. LEAN runs a backtest (`main.py` in `TRAIN` mode) — the agent observes 15-minute bars, takes actions, and learns via experience replay
+4. Every `n_test` iterations (default 5), an evaluation run executes on a held-out period with frozen weights
 
 **Passing hyperparameters** — use `-p key=value` pairs:
 
@@ -212,23 +219,36 @@ python qtrader_optimize.py \
 
 **Search space** (defined in `qtrader_optimize.py`):
 
-| Parameter            | Range                         |
-|---------------------|-------------------------------|
-| `expl_min`          | 0.01 – 0.15 (step 0.01)      |
-| `n_steps_checkpoint`| 500 – 5000 (step 250)        |
-| `exp_weighting`     | 0.3 – 0.7 (step 0.05)        |
-| `exp_alpha`         | 0.3 – 0.8 (step 0.05)        |
-| `model_lr`          | {1e-5, 5e-5, 1e-4}           |
-| `rl_gamma`          | {0.9, 0.95, 0.99}            |
+| Parameter            | Type        | Range / Values              |
+|---------------------|-------------|-----------------------------|
+| `expl_min`          | float       | 0.01 – 0.10 (step 0.01)    |
+| `n_steps_checkpoint`| int         | 500 – 5,000 (step 250)     |
+| `alpha_dd`          | float       | 2.0 – 10.0 (step 1.0)      |
+| `exp_alpha`         | float       | 0.4 – 0.8 (step 0.1)       |
 
-**Pruning rules** — trials are killed early if:
+**Static parameters** (fixed across all trials):
 
-- Fewer than 10 trades after step 200
-- Max drawdown exceeds 50%
-- Sharpe ratio drops below -1.0
-- Performance is in the bottom 33rd percentile (after 5 startup trials)
+| Parameter            | Value       | Notes                                  |
+|---------------------|-------------|----------------------------------------|
+| `invest_pct`        | (0.05, 0.5) | Uniformly randomized per iteration    |
+| `eval_invest_pct`   | 0.25        | Fixed during evaluation runs           |
+| `expl_decay`        | 0.9925      | Per-checkpoint decay                   |
+| `n_step_update`     | 8           | Weight update every 8 steps            |
+| `exp_memory_size`   | ~4.9M       | 7 years × 96 bars/day × 2             |
+| `exp_mini_batch_size`| 128        |                                        |
+| `exp_weighting`     | 0.4         | IS beta starting value                 |
+| `exp_w_inc`         | 5e-5        | IS beta annealing increment            |
+| `model_lr`          | 1e-4        | Adam learning rate                     |
+| `rl_gamma`          | 0.9         | Discount factor                        |
+| `target_tau`        | 0.001       | Target network soft update rate        |
+| `model_n_layers`    | 1           | Single hidden layer                    |
+| `model_fl_size`     | 256         | Hidden layer width                     |
+| `iters`             | 500         | Episodes per trial                     |
+| `n_test`            | 10          | Evaluate every 10 iterations           |
 
 **Objective:** maximize Sharpe ratio on the evaluation period.
+
+**Pruning:** Optuna's `PercentilePruner` drops the bottom third of trials after 200 steps, with 5 startup trials and a minimum of 3 completed trials before pruning kicks in.
 
 ### 4. Evaluate a Trained Model
 
@@ -257,7 +277,7 @@ On every 15-minute consolidated bar, the pipeline executes:
 
 ```
 State Providers    →    Aggregation    →    Agent Act    →    Feedback & Learn
-(indicators,            (60-dim feature     (ε-greedy        (reward calc,
+(indicators,            (70-dim feature     (ε-greedy        (reward calc,
  position info,          vector)             action           experience replay,
  account info)                               selection)       weight update)
 ```
@@ -265,9 +285,9 @@ State Providers    →    Aggregation    →    Agent Act    →    Feedback & L
 **Step by step:**
 
 1. **State computation** — each state provider (Bridge Bands, MACD, OHLCV, position, account) runs and its output is cached
-2. **Aggregation** — all provider outputs are combined into a flat 60-dimensional feature vector
+2. **Aggregation** — all provider outputs are combined into a flat 70-dimensional feature vector
 3. **Action** — the agent picks `FLAT` (exit/hold) or `LONG` (enter/hold) via ε-greedy policy
-4. **Feedback** — reward is computed from portfolio return and holding penalty
+4. **Feedback** — reward is computed from market return, trade cost, and drawdown penalty
 5. **Learn** — every `n_step_update` steps, the agent samples a mini-batch from the replay buffer and updates the online network
 
 ### Agent (DQTP)
@@ -276,47 +296,47 @@ The agent is a **Double DQN** with **Prioritized Experience Replay**:
 
 - **Online network** — predicts Q-values, updated via gradient descent
 - **Target network** — provides stable TD targets, updated via soft copy: `θ_target ← (1-τ)·θ_target + τ·θ_online`
-- **Replay buffer** — segment-tree based prioritized sampling (higher TD-error = higher sampling probability)
-
-**Network architecture:**
-
-```
-Input (60 features)
-  → LayerNormalization
-  → Dense(128, ELU) + optional L2 regularization
-  → Dense(64, ELU)      ← "cone" shape (shrinking layers)
-  → Dense(2, Linear)    ← Q-values for [FLAT, LONG]
-```
+- **Replay buffer** — segment-tree based prioritized sampling (higher TD-error = higher sampling probability). New experiences are inserted at `max_priority`, which soft-decays (×0.999) toward the actual observed maximum to prevent stale priority inflation
 
 **Key hyperparameters:**
 
-| Parameter             | Default      | Description                               |
-|-----------------------|-------------|-------------------------------------------|
-| `expl_max`            | 1.0         | Initial exploration rate                   |
-| `expl_min`            | 0.01        | Minimum exploration rate                   |
-| `expl_decay`          | 0.9995      | Exploration decay per checkpoint           |
-| `exp_memory_size`     | 36,500,000  | Replay buffer capacity                     |
-| `exp_mini_batch_size` | 32          | Mini-batch size for learning               |
-| `exp_alpha`           | 0.8         | Priority exponent (α in PER)              |
-| `n_steps_warmup`      | 10,240      | Steps before first weight update           |
-| `n_step_update`       | 96          | Update frequency (~1 day at 15m bars)     |
-| `target_tau`          | 0.005       | Soft update rate for target network        |
-| `rl_gamma`            | 0.9         | Discount factor                            |
-| `model_lr`            | 1e-4        | Adam learning rate                         |
-| `invest_pct`          | 0.05        | Fraction of account value per trade (5%)  |
+| Parameter             | Default  | Description                                      |
+|-----------------------|----------|--------------------------------------------------|
+| `expl_max`            | 1.0      | Initial exploration rate                          |
+| `expl_min`            | 0.01     | Minimum exploration rate                          |
+| `expl_decay`          | 0.9      | Exploration decay per checkpoint                  |
+| `exp_memory_size`     | 365      | Replay buffer capacity (passed as raw value)      |
+| `exp_mini_batch_size` | 128      | Mini-batch size for learning                      |
+| `exp_alpha`           | 0.8      | Priority exponent (α in PER)                     |
+| `exp_weighting`       | 0.4      | Importance-sampling β (annealed toward 1.0)      |
+| `exp_w_inc`           | 0.0005   | IS β increment per learning step                 |
+| `n_steps_warmup`      | 1,000    | Steps before first weight update                  |
+| `n_step_update`       | 10       | Steps between weight updates                      |
+| `n_steps_checkpoint`  | 1,000    | Steps between exploration decay & model save      |
+| `target_tau`          | 0.001    | Soft update rate for target network               |
+| `rl_gamma`            | 0.9      | Discount factor                                   |
+| `model_lr`            | 1e-4     | Adam learning rate (with gradient clipnorm=1.0)   |
+| `model_l2_reg`        | 0.0      | L2 regularization strength                        |
+| `invest_pct`          | 0.02     | Fraction of account value per trade               |
+
+Note: the target network is updated on **every learning step** (not on a separate schedule), making `target_tau` the primary knob for controlling target lag. Q-value targets are clipped to [-15, 15] and TD errors are clipped to [0, 5] to prevent runaway bootstrapping.
 
 ### Feature Engineering
 
-The agent observes a **60-dimensional** feature vector built from multi-timeframe indicators:
+The agent observes a **70-dimensional** feature vector built from multi-timeframe indicators:
 
-| Group                  | Features | Description                                              |
-|-----------------------|----------|----------------------------------------------------------|
-| Time encoding          | 6        | sin/cos of weekday, hour, minute                         |
-| Position info          | 5        | sign, ROE, trade count, days since/in trade              |
-| OHLC (normalized)      | 3        | open/high/low relative to close, scaled by BB width      |
-| Bridge Bands (×3 scales) | 27     | band width, band position, Hurst exponent at 3 lookbacks |
-| MACD (×3 scales)       | 18       | MACD value and histogram at 3 lookbacks                  |
-| **Total**              | **60**   |                                                          |
+| Group                    | Features | Description                                              |
+|-------------------------|----------|----------------------------------------------------------|
+| Time encoding            | 6        | sin/cos of weekday, hour, minute                         |
+| Position info            | 5        | sign, ROE (position-relative), trade count, days since/in trade |
+| OHLC (normalized)        | 3        | open/high/low relative to close, scaled by BB width      |
+| Candle body ratio        | 1        | abs(close-open) / (high-low) — conviction vs indecision  |
+| Log-returns              | 3        | raw log-return at 1, 4, 16 bars back (×100)              |
+| Relative volume          | 3        | log1p(volume / mean_16) at 1, 4, 16 bars back            |
+| Bridge Bands (×3 scales) | 27       | band width, band position, Hurst exponent at 3 lookbacks |
+| BB position velocity     | 3        | 4-bar change in band position per scale                  |
+| MACD (×3 scales)         | 18       | MACD value and histogram at 3 lookbacks                  |
+| **Total**                | **70**   |                                                          |
 
 **Multi-timeframe scales:**
 
@@ -331,39 +351,56 @@ Each indicator is also observed at **3 lookback windows** (1, 4, 16 bars back), 
 ### Reward Function
 
 ```
-R(t) = P(t) × (log_return - commission_fraction) × scale  -  P(t) × holding_penalty
+R(t) = P(t) × log_return × scale
+     - comm_frac × scale
+     - P(t) × α_dd × max(-ROE, 0)
 ```
+
+Three independent terms:
+
+1. **Market return** — only received while LONG, gated by P(t)
+2. **Trade cost** — commission penalty applied on every position change (entry *and* exit), independent of P(t)
+3. **Drawdown penalty** — proportional to how underwater the current position is; winning positions incur zero penalty regardless of hold duration
 
 Where:
 
 - **P(t)** = 1 if in a LONG position, 0 if FLAT
 - **log_return** = log(price_t / price_{t-1})
-- **commission_fraction** = commission paid / account value
-- **scale** = 960 (normalizes daily return to ~1.0)
-- **holding_penalty** = `α × (exp(days_in_trade / τ) - 1)` with α=0.002/96 per step and τ=14 days
+- **comm_frac** = commission / position notional (position-relative, not account-relative)
+- **ROE** = unrealized profit / cost basis of the current position
+- **scale** = 150 (targets ~90% of raw rewards in [-1, 1] for BTC 15-minute σ ≈ 0.004)
+- **α_dd** = 5.0 (drawdown penalty coefficient)
 
-The penalty discourages holding losing positions indefinitely while the log-return reward aligns the agent with profitable trading.
+Drawdown penalty at typical ROE levels (vs a ±0.6 typical bar reward):
+
+| Position ROE | Penalty | Relative to bar |
+|---|---|---|
+| -1% | 0.05 | ~8% — gentle nudge |
+| -5% | 0.25 | ~40% — real pressure |
+| -10% | 0.50 | ~80% — strong exit signal |
+| ≥ 0% | 0.00 | no penalty |
+
+The commission is measured relative to the position notional (`commission / (account_value × invest_pct)`), making it directly comparable to the market log-return regardless of position sizing.
 
 ### Caching & Persistence
 
-The persistence layer is a hierarchy of providers optimized for throughput:
+The persistence layer uses **diskcache.Index** (a SQLite-backed key-value store) instead of raw SQLite tables:
 
 ```
-LeanCachedSQLitePersistenceProvider     ← used in main.py
-  ├── In-memory read cache (LRU, 1M entries)
-  ├── Batched writes (flush every 256 ops)
-  ├── SQLite with WAL mode
+LeanDiskIndexPersistenceProvider        ← used in main.py
+  ├── Optional read-through cache_provider (golden cache)
+  ├── diskcache.Index (SQLite + filesystem)
+  ├── msgpack serialization for dicts
   └── LEAN Object Store integration
 ```
 
 **Golden cache workflow:**
 
-1. `qtrader_warmup.py` runs once over the full date range, populating `golden_cache.db`
-2. At the start of each training iteration, `golden_cache.db` is copied to the trial directory
-3. `warm_cache_for_range()` pre-loads the relevant date range into memory
-4. During the backtest, cache hits are served from memory — cache misses fall through to SQLite
+1. `qtrader_warmup.py` runs once over the full date range, populating a `diskcache.Index` directory (the golden cache). Warmup runs in parallel — the date range is chunked and each chunk runs as a separate LEAN backtest in Docker, then results are merged into a single index.
+2. At the start of each training/eval backtest, the golden cache directory is passed as a read-through `cache_provider` to `LeanDiskIndexPersistenceProvider`
+3. During the backtest, key lookups check the golden cache first — misses fall through to the trial's own diskcache.Index
 
-**Serialization:** [msgpack](https://msgpack.org/) (binary, fast) with gzip+JSON fallback for legacy data.
+**Serialization:** [msgpack](https://msgpack.org/) (binary, fast) for dict payloads; native pickle for arbitrary objects (models, replay buffers).
 
 ---
 
@@ -451,14 +488,16 @@ python qtrader_trainer.py --name NAME --iters N [-p key=value ...]
 ### `qtrader_warmup.py` CLI
 
 ```
-python qtrader_warmup.py --date-start YYYY-MM-DD --date-end YYYY-MM-DD --golden-db PATH
+python qtrader_warmup.py --date-start YYYY-MM-DD --date-end YYYY-MM-DD --golden-cache-dir PATH
 ```
 
-| Flag           | Description                              |
-|---------------|------------------------------------------|
-| `--date-start`| Start date for cache computation         |
-| `--date-end`  | End date for cache computation           |
-| `--golden-db` | Output path for the golden cache SQLite  |
+| Flag                 | Description                                     |
+|---------------------|-------------------------------------------------|
+| `--date-start`      | Start date for cache computation                |
+| `--date-end`        | End date for cache computation                  |
+| `--golden-cache-dir`| Output directory for the golden diskcache.Index |
+| `--chunk-months`    | Months per parallel chunk (default: 4)          |
+| `--workers`         | Max parallel Docker workers                     |
 
 ### `qtrader_optimize.py` CLI
 
@@ -474,22 +513,23 @@ python qtrader_optimize.py --name NAME --num-trials N --path PATH
 
 ### Agent hyperparameters (passed via `-p`)
 
-| Key                   | Type    | Default       | Description                          |
-|-----------------------|---------|---------------|--------------------------------------|
-| `expl_min`            | float   | 0.01          | Minimum exploration rate             |
-| `expl_decay`          | float   | 0.9995        | Exploration rate decay               |
-| `exp_memory_size`     | int     | 36,500,000    | Replay buffer size                   |
-| `exp_mini_batch_size` | int     | 32            | Learning batch size                  |
-| `exp_weighting`       | float   | 0.4           | PER importance sampling beta         |
-| `exp_alpha`           | float   | 0.8           | PER priority exponent                |
-| `n_steps_warmup`      | int     | 10,240        | Steps before learning starts         |
-| `n_step_update`       | int     | 96            | Steps between weight updates         |
-| `n_steps_checkpoint`  | int     | 5,000         | Steps between checkpoints            |
-| `target_tau`          | float   | 0.005         | Target network soft update rate      |
-| `model_n_layers`      | int     | 2             | Number of hidden layers              |
-| `model_fl_size`       | int     | 128           | First layer width                    |
-| `model_shape`         | str     | `"cone"`      | `"cone"` (shrinking) or `"flat"`     |
-| `model_lr`            | float   | 1e-4          | Adam learning rate                   |
-| `model_l2_reg`        | float   | 0.0           | L2 regularization strength           |
-| `rl_gamma`            | float   | 0.9           | Discount factor                      |
-| `invest_pct`          | float   | 0.05          | Fraction of account per trade        |
+| Key                   | Type    | Default       | Description                               |
+|-----------------------|---------|---------------|-------------------------------------------|
+| `expl_min`            | float   | 0.01          | Minimum exploration rate                  |
+| `expl_decay`          | float   | 0.9           | Exploration rate decay per checkpoint     |
+| `exp_memory_size`     | int     | 365           | Replay buffer capacity (raw value)        |
+| `exp_mini_batch_size` | int     | 128           | Learning batch size                       |
+| `exp_weighting`       | float   | 0.4           | PER importance-sampling β (annealed)     |
+| `exp_w_inc`           | float   | 0.0005        | IS β increment per learning step         |
+| `exp_alpha`           | float   | 0.8           | PER priority exponent                     |
+| `n_steps_warmup`      | int     | 1,000         | Steps before learning starts              |
+| `n_step_update`       | int     | 10            | Steps between weight updates              |
+| `n_steps_checkpoint`  | int     | 1,000         | Steps between checkpoints                 |
+| `target_tau`          | float   | 0.001         | Target network soft update rate           |
+| `model_n_layers`      | int     | 2             | Number of hidden layers                   |
+| `model_fl_size`       | int     | 128           | First layer width                         |
+| `model_shape`         | str     | `"cone"`      | `"cone"` (shrinking) or `"flat"`          |
+| `model_lr`            | float   | 1e-4          | Adam learning rate (clipnorm=1.0)         |
+| `model_l2_reg`        | float   | 0.0           | L2 regularization strength                |
+| `rl_gamma`            | float   | 0.9           | Discount factor                           |
+| `invest_pct`          | float   | 0.02          | Fraction of account per trade             |
