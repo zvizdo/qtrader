@@ -44,8 +44,9 @@ class DQTPAgent(BaseAgent):
         model_layers=[32],
         model_act_func="elu",  # model related
         rl_gamma=0.9,
-        reward_type="clipped",  # "sign", "clipped", or "adaptive"
-        flat_penalty_mult=-2.0,
+        hold_cost_scale=0.05,
+        exit_bonus_scale=50.0,
+        action_cooldown_bars=0,
         no_learn=False,
         no_full_state=True,
     ):
@@ -79,8 +80,9 @@ class DQTPAgent(BaseAgent):
         self.model_act_func = model_act_func
 
         self.rl_gamma = rl_gamma
-        self.reward_type = reward_type
-        self.flat_penalty_mult = flat_penalty_mult
+        self.hold_cost_scale = hold_cost_scale
+        self.exit_bonus_scale = exit_bonus_scale
+        self.action_cooldown_bars = action_cooldown_bars
 
         self.model_name = "QAgent-Model-{}.keras"
         self.model_online = None
@@ -155,7 +157,18 @@ class DQTPAgent(BaseAgent):
             print(f"FAILED TO SAVE REPLAY BUFFER: {e}")
 
     def _possible_actions(self, symbol: str, state: dict):
-        return np.ones(len(self.ACTIONS))
+        pa = np.ones(len(self.ACTIONS))
+        if getattr(self, "action_cooldown_bars", 0) > 0:
+            pos = state["state_symbol"][symbol]["position"]
+            if pos:
+                trade = state["state_symbol"][symbol]["trade"]
+                if trade:
+                    cdt = datetime.fromisoformat(state["state_global"]["account"]["current_datetime"])
+                    entry_dt = datetime.fromisoformat(trade[0]["datetime"])
+                    bars_held = (cdt - entry_dt).total_seconds() / (15 * 60)
+                    if bars_held < self.action_cooldown_bars:
+                        pa[0] = 0.0 # Disable FLAT
+        return pa
 
     def _shape_action(self, a: dict, symbol: str, state: dict):
         account_value = state["state_global"]["account"]["value"]
@@ -185,14 +198,18 @@ class DQTPAgent(BaseAgent):
         for sy in symbols:
             pa = self._possible_actions(sy, state)
 
+            # Per-bar exploration (standard DQN epsilon-greedy).
+            # NOTE: Episodic exploration (suppressing exploration when LONG) was tried
+            # in the F-series and caused catastrophic hyper-trading — the Q-network
+            # itself exits at the cooldown boundary without random noise to break the
+            # position-feature feedback loop. Reverted to per-bar exploration.
+            # Instead, expl_min is lowered to allow longer holds naturally.
+
             # exploration or model agent prediction
             if self.model_online is None or (
                 not self.no_learn and np.random.rand() < self.expl_rate
             ):
-                # create random action — biased 70% LONG / 30% FLAT
-                # to generate longer holds during exploration and reduce
-                # fee drag from frequent random transitions
-                exploration_bias = np.array([0.3, 0.7]) * pa
+                exploration_bias = np.array([0.5, 0.5]) * pa
                 exploration_bias /= exploration_bias.sum()
                 ai = np.random.choice(len(self.ACTIONS), p=exploration_bias)
                 a = self.ACTIONS[ai]
@@ -267,15 +284,25 @@ class DQTPAgent(BaseAgent):
                     comm_frac = last_order.get("comm", 0.0) / (position_notional + 1e-8)
             reward[sy]["comm_frac"] = comm_frac
 
-            # Adaptive scale factor (rolling 24h volatility normalization)
-            closes = state["state_symbol"][sy]["ohlcv"]["close"]
-            if len(closes) >= 97:
-                recent_rets = np.diff(np.log(closes[-97:]))
-                rolling_vol = np.std(recent_rets)
+            # Hold duration in hours (for duration-based holding cost)
+            cdt = datetime.fromisoformat(
+                state["state_global"]["account"]["current_datetime"]
+            )
+            trade_history = state["state_symbol"][sy]["trade"]
+            if pos_prev and trade_history:
+                trade_start_dt = datetime.fromisoformat(trade_history[0]["datetime"])
+                reward[sy]["hold_hours"] = (
+                    abs((cdt - trade_start_dt).total_seconds()) / 3600.0
+                )
             else:
-                rolling_vol = 0.004
-            vol_ratio = min(rolling_vol / (0.004 + 1e-8), 5.0)
-            reward[sy]["adaptive_scale"] = 150.0 / (0.5 + 0.5 * vol_ratio)
+                reward[sy]["hold_hours"] = 0.0
+
+            # Trade PnL % on exit (for trade-completion bonus)
+            if p_t_prev > 0.5 and p_t < 0.5 and pos_prev:
+                cost_basis = pos_prev["value"] - pos_prev["profit"]
+                reward[sy]["trade_pnl_pct"] = pos_prev["profit"] / (
+                    cost_basis + 1e-8
+                )
 
         # update state
         state["reward"] = reward
@@ -434,49 +461,50 @@ class DQTPAgent(BaseAgent):
         return ex
 
     _REWARD_SCALE = 150.0  # targets ~90% of rewards in [-1, 1] for BTC 15m σ≈0.004
+    _HOLD_THRESHOLD_HOURS = 72.0  # 3 days free hold, then cost ramps
+    _HOLD_COST_POWER = 1.5  # power-law ramp after threshold
+    _EXIT_BONUS_CAP = 3.0  # max positive exit bonus
+    _EXIT_LOSS_CAP = -2.0  # max negative exit penalty
+    _EXIT_LOSS_RATIO = 1.0  # loss_scale = exit_bonus_scale × this ratio
 
     def _generate_reward(self, rewards):
+        """Active trader reward: clipped market return + hold duration cost + exit bonus."""
+        return np.array([self._reward_active(re) for re in rewards])
+
+    def _reward_active(self, re):
+        """Combined duration cost (Option A) + exit bonus (Option B).
+
+        LONG: clipped market return − hold cost (ramps after 72h)
+        FLAT: 0 (no penalty — eliminates death spiral)
+        Exit bar: lump-sum bonus/penalty based on full trade PnL%
         """
-        Reward dispatcher — selected by self.reward_type.
-
-        "sign"     — Binary: LONG+up=+1, LONG+down=-1, FLAT=-0.2
-        "clipped"  — clip(log_ret × 150, -1, 1) when LONG, 0 when FLAT
-        "adaptive" — log_ret × adaptive_scale when LONG, 0 when FLAT
-
-        All variants subtract real trade cost (comm_frac) on position changes.
-        """
-        compute = getattr(self, f"_reward_{self.reward_type}", None)
-        if compute is None:
-            raise ValueError(f"Unknown reward_type: {self.reward_type!r}. "
-                             f"Must be 'sign', 'clipped', or 'adaptive'.")
-        return np.array([compute(re) for re in rewards])
-
-    def _reward_sign(self, re):
-        """LONG+up → +1, LONG+down → -1, FLAT → -0.2, trade cost on change."""
-        p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
-        direction = 1.0 if re.get("market_log_return", 0.0) > 0 else -1.0
-        trade_cost = re.get("comm_frac", 0.0) * self._REWARD_SCALE
-        flat_penalty = -2.0 * (1.0 - self.rl_gamma)
-        return p_t * direction - trade_cost + (1.0 - p_t) * flat_penalty
-
-    def _reward_clipped(self, re):
-        """clip(log_ret × 150, -1, 1) when LONG, 0 when FLAT."""
         p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
         market_return = np.clip(
             re.get("market_log_return", 0.0) * self._REWARD_SCALE, -1.0, 1.0
         )
         trade_cost = re.get("comm_frac", 0.0) * self._REWARD_SCALE
-        flat_penalty = self.flat_penalty_mult * (1.0 - self.rl_gamma) # -2.0 * (1.0 - self.rl_gamma)
-        return p_t * market_return - trade_cost + (1.0 - p_t) * flat_penalty
 
-    def _reward_adaptive(self, re):
-        """log_ret × adaptive_scale when LONG, 0 when FLAT."""
-        p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
-        adaptive_s = re.get("adaptive_scale", self._REWARD_SCALE)
-        market_return = re.get("market_log_return", 0.0) * adaptive_s
-        trade_cost = re.get("comm_frac", 0.0) * adaptive_s
-        flat_penalty = -2.0 * (1.0 - self.rl_gamma)
-        return p_t * market_return - trade_cost + (1.0 - p_t) * flat_penalty
+        # Duration-based holding cost: free for first 72h, then power-law ramp
+        hold_hours = re.get("hold_hours", 0.0)
+        if hold_hours > self._HOLD_THRESHOLD_HOURS:
+            excess_days = (hold_hours - self._HOLD_THRESHOLD_HOURS) / 24.0
+            hold_cost = self.hold_cost_scale * excess_days ** self._HOLD_COST_POWER
+        else:
+            hold_cost = 0.0
+
+        # Trade-completion bonus: only on exit bar
+        exit_bonus = 0.0
+        trade_pnl_pct = re.get("trade_pnl_pct", None)
+        if trade_pnl_pct is not None:
+            if trade_pnl_pct > 0:
+                exit_bonus = min(trade_pnl_pct * self.exit_bonus_scale, self._EXIT_BONUS_CAP)
+            else:
+                loss_scale = self.exit_bonus_scale * self._EXIT_LOSS_RATIO
+                exit_bonus = max(trade_pnl_pct * loss_scale, self._EXIT_LOSS_CAP)
+
+        R_long = market_return - hold_cost
+        R_flat = 0.0  # no flat penalty
+        return p_t * R_long - trade_cost + (1.0 - p_t) * R_flat + exit_bonus
 
     def _generate_examples_from_state(self, sf) -> Optional[tuple]:
         state = self.pprovider.load_dict(name=sf) if not isinstance(sf, dict) else sf

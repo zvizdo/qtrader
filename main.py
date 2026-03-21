@@ -100,8 +100,9 @@ class QTraderAlgorithm(QCAlgorithm):
             ],  # model related
             rl_gamma=float(params.get("rl_gamma", 0.9)),
             target_tau=float(params.get("target_tau", 0.001)),
-            reward_type=str(params.get("reward_type", "sign")),
-            flat_penalty_mult=float(params.get("flat_penalty_mult", -2.0)),
+            hold_cost_scale=float(params.get("hold_cost_scale", 0.05)),
+            exit_bonus_scale=float(params.get("exit_bonus_scale", 50.0)),
+            action_cooldown_bars=int(params.get("action_cooldown_bars", 0)),
         )
 
         return agent
