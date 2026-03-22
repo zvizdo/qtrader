@@ -43,7 +43,6 @@ class TrainingLogger:
             - mean_td_error
             - mean_portfolio_change   (renamed from mean_reward)
             - mean_shaped_reward      (actual DQN training reward)
-            - mean_market_log_change
             - exploration_rate
             - n_updates
             - replay_buffer_size
@@ -76,10 +75,6 @@ class TrainingLogger:
                 tf.summary.scalar(
                     "train/mean_portfolio_change", float(s["mean_portfolio_change"])
                 )
-            if "mean_market_log_change" in s:
-                tf.summary.scalar(
-                    "train/mean_market_log_change", float(s["mean_market_log_change"])
-                )
 
             # -- Agent state --
             if "exploration_rate" in s:
@@ -99,6 +94,10 @@ class TrainingLogger:
                 - _safe_float(perf, "portfolioStatistics", "startEquity")
             )
             tf.summary.scalar("train/profit", pnl)
+            tf.summary.scalar(
+                "train/num_trades",
+                _safe_float(perf, "tradeStatistics", "totalNumberOfTrades"),
+            )
 
         self._writer.flush()
 

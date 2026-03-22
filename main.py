@@ -47,6 +47,7 @@ from qtrader.stateproviders.basic import (
 from qtrader.stateproviders.indicators import (
     BridgeBandsSymbolStateProvider,
     MACDSymbolStateProvider,
+    TrendMaturitySymbolStateProvider,
 )
 
 # endregion
@@ -54,7 +55,7 @@ from qtrader.stateproviders.indicators import (
 
 class QTraderAlgorithm(QCAlgorithm):
 
-    BAR_PERIOD = timedelta(minutes=15)
+    BAR_PERIOD = timedelta(hours=1)
 
     def _load_run_params(self):
         params = {}
@@ -103,6 +104,7 @@ class QTraderAlgorithm(QCAlgorithm):
             hold_cost_scale=float(params.get("hold_cost_scale", 0.05)),
             exit_bonus_scale=float(params.get("exit_bonus_scale", 50.0)),
             action_cooldown_bars=int(params.get("action_cooldown_bars", 0)),
+            bar_period_seconds=int(self.BAR_PERIOD.total_seconds()),
         )
 
         return agent
@@ -137,8 +139,8 @@ class QTraderAlgorithm(QCAlgorithm):
         self.symbol = self.exchange.symbol
         self.set_time_zone(self.exchange.exchange.time_zone)
 
-        # Create rolling window for the maximum lookback (approx 36 days of 15-min bars)
-        self.history_window = RollingWindow[TradeBar](3500)
+        # Create rolling window for the maximum lookback (approx 58 days of 1H bars)
+        self.history_window = RollingWindow[TradeBar](1400)
 
         # Consolidator: 1-min → BAR_PERIOD bars
         self._consolidator = TradeBarConsolidator(self.BAR_PERIOD)
@@ -147,7 +149,7 @@ class QTraderAlgorithm(QCAlgorithm):
         # -- WARMUP --
         # Fetch minute bars and push them through the consolidator
         self.debug("Warming up consolidator...")
-        history_bars = self.history[TradeBar](self.symbol, timedelta(days=36), Resolution.MINUTE)
+        history_bars = self.history[TradeBar](self.symbol, timedelta(days=60), Resolution.MINUTE)
         for bar in history_bars:
             self._consolidator.update(bar)
         self.debug(f"Warmup complete. Window size: {self.history_window.count}")
@@ -217,85 +219,99 @@ class QTraderAlgorithm(QCAlgorithm):
             self.menv,
             self.pprovider,
             OHLCVSymbolStateProvider,
-            params={"days_ago": 4},
+            params={"days_ago": 4, "cache_truncate": 73},
             name="OHLCVSymbol",
             allow_cache=True,
         )
 
-        # -- Bridge Bands: micro (3.5h structure) --
+        # -- Bridge Bands: micro (12h entry timing) --
         self.task_ssp_bb_micro = StateProviderTask(
             self.menv,
             self.pprovider,
             BridgeBandsSymbolStateProvider,
-            params={"days_ago": 4, "bridge_range_length": 14,
-                    "bollinger_bands_length": 14, "hurst_exp_length": 14,
-                    "state_key": "bridge_bnds_micro"},
+            params={"days_ago": 4, "bridge_range_length": 12,
+                    "bollinger_bands_length": 12, "hurst_exp_length": 12,
+                    "state_key": "bridge_bnds_micro", "cache_truncate": 73},
             name="BBMicro",
             allow_cache=True,
         )
-        # -- Bridge Bands: daily (1-day volatility regime) --
+        # -- Bridge Bands: daily (4-day hold regime) --
         self.task_ssp_bb_daily = StateProviderTask(
             self.menv,
             self.pprovider,
             BridgeBandsSymbolStateProvider,
             params={"days_ago": 10, "bridge_range_length": 96,
                     "bollinger_bands_length": 96, "hurst_exp_length": 96,
-                    "state_key": "bridge_bnds_daily"},
+                    "state_key": "bridge_bnds_daily", "cache_truncate": 73},
             name="BBDaily",
             allow_cache=True,
         )
-        # -- Bridge Bands: weekly (5-day trend regime) --
+        # -- Bridge Bands: weekly (14-day trend regime) --
         self.task_ssp_bb_weekly = StateProviderTask(
             self.menv,
             self.pprovider,
             BridgeBandsSymbolStateProvider,
-            params={"days_ago": 30, "bridge_range_length": 480,
-                    "bollinger_bands_length": 480, "hurst_exp_length": 480,
-                    "state_key": "bridge_bnds_weekly"},
+            params={"days_ago": 30, "bridge_range_length": 336,
+                    "bollinger_bands_length": 336, "hurst_exp_length": 336,
+                    "state_key": "bridge_bnds_weekly", "cache_truncate": 73},
             name="BBWeekly",
             allow_cache=True,
         )
 
-        # -- MACD: micro (intraday momentum, 12/26/9 on 15m bars) --
+        # -- MACD: micro (12h momentum) --
         self.task_ssp_macd_micro = StateProviderTask(
             self.menv,
             self.pprovider,
             MACDSymbolStateProvider,
             params={
                 "days_ago": 4,
-                "ema_short_length": 12,
-                "ema_long_length": 26,
-                "signal_length": 9,
+                "ema_short_length": 6,
+                "ema_long_length": 13,
+                "signal_length": 4,
+                "cache_truncate": 73,
             },
             name="MACDMicro",
             allow_cache=True,
         )
-        # -- MACD: daily (swing momentum, ~1d/3d) --
+        # -- MACD: daily (3-day swing momentum) --
         self.task_ssp_macd_daily = StateProviderTask(
             self.menv,
             self.pprovider,
             MACDSymbolStateProvider,
             params={
                 "days_ago": 10,
-                "ema_short_length": 96,
-                "ema_long_length": 288,
-                "signal_length": 96,
+                "ema_short_length": 24,
+                "ema_long_length": 72,
+                "signal_length": 24,
+                "cache_truncate": 73,
             },
             name="MACDDaily",
             allow_cache=True,
         )
-        # -- MACD: weekly (macro momentum, ~5d/10d) --
+        # -- MACD: weekly (14-day macro momentum) --
         self.task_ssp_macd_weekly = StateProviderTask(
             self.menv,
             self.pprovider,
             MACDSymbolStateProvider,
             params={
                 "days_ago": 30,
-                "ema_short_length": 480,
-                "ema_long_length": 960,
-                "signal_length": 192,
+                "ema_short_length": 112,
+                "ema_long_length": 240,
+                "signal_length": 48,
+                "cache_truncate": 73,
             },
             name="MACDWeekly",
+            allow_cache=True,
+        )
+
+        # -- Trend Maturity (7-bar swing structure, tuned for ~3-day trades) --
+        self.task_ssp_trend_maturity = StateProviderTask(
+            self.menv,
+            self.pprovider,
+            TrendMaturitySymbolStateProvider,
+            params={"days_ago": 10, "swing_order": 7, "lookback": 120,
+                    "state_key": "trend_maturity", "cache_truncate": 73},
+            name="TrendMaturity",
             allow_cache=True,
         )
 
@@ -372,6 +388,10 @@ class QTraderAlgorithm(QCAlgorithm):
             self.task_ssp_macd_weekly.run(symbol=sy, cache_enabled=self.p_cache_enabled)
             for sy in self.p_symbols
         ]
+        rslt_task_ssp_trend_maturity = [
+            self.task_ssp_trend_maturity.run(symbol=sy, cache_enabled=self.p_cache_enabled)
+            for sy in self.p_symbols
+        ]
 
         state = self.task_state_agg.run(
             symbols=self.p_symbols,
@@ -386,6 +406,7 @@ class QTraderAlgorithm(QCAlgorithm):
                 rslt_task_ssp_macd_micro,
                 rslt_task_ssp_macd_daily,
                 rslt_task_ssp_macd_weekly,
+                rslt_task_ssp_trend_maturity,
             ],
         )
 
@@ -477,11 +498,6 @@ class QTraderAlgorithm(QCAlgorithm):
         #         "mean_portfolio_change",
         #         self.task_feedback.ttl_reward / self.task_feedback.num_feedbacks,
         #     )
-
-        if hasattr(agent, "market_log_change_tracker_n") and agent.market_log_change_tracker_n > 0:
-            self.set_summary_statistic(
-                "mean_market_log_change", agent.market_log_change_tracker / agent.market_log_change_tracker_n
-            )
 
         # -- Agent state --
         self.set_summary_statistic("exploration_rate", agent.expl_rate)

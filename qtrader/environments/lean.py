@@ -9,7 +9,7 @@ from qtrader.rlflow.persistence import BasePersistenceProvider
 
 class LeanMarketEnv(BaseMarketEnv):
 
-    def __init__(self, qcl, pprovider: BasePersistenceProvider, bar_period: timedelta = timedelta(minutes=15), verbose=True):
+    def __init__(self, qcl, pprovider: BasePersistenceProvider, bar_period: timedelta = timedelta(hours=1), verbose=True):
         super().__init__()
 
         self.qcl = qcl  # QuantConnect Lean Env
@@ -23,19 +23,14 @@ class LeanMarketEnv(BaseMarketEnv):
 
     def get_current_market_datetime(self):
         dt = self.qcl.time
-        
-        # Snap to perfectly align with bar period (e.g. 15m) to prevent cache misses 
+
+        # Snap to perfectly align with bar period to prevent cache misses
         # caused by slightly offset triggers like 00:01
-        minutes_period = int(self.bar_period.total_seconds() / 60.0)
-        m_total = dt.hour * 60 + dt.minute
-        snapped_m_total = (m_total // minutes_period) * minutes_period
-        
-        return dt.replace(
-            hour=(snapped_m_total // 60),
-            minute=(snapped_m_total % 60),
-            second=0,
-            microsecond=0
-        )
+        midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_since_midnight = (dt - midnight).total_seconds()
+        period_seconds = self.bar_period.total_seconds()
+        snapped_seconds = (seconds_since_midnight // period_seconds) * period_seconds
+        return midnight + timedelta(seconds=snapped_seconds)
 
     def get_account_value(self):
         return self.qcl.portfolio.total_portfolio_value

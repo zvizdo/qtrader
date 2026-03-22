@@ -47,6 +47,7 @@ class DQTPAgent(BaseAgent):
         hold_cost_scale=0.05,
         exit_bonus_scale=50.0,
         action_cooldown_bars=0,
+        bar_period_seconds=3600,
         no_learn=False,
         no_full_state=True,
     ):
@@ -83,6 +84,7 @@ class DQTPAgent(BaseAgent):
         self.hold_cost_scale = hold_cost_scale
         self.exit_bonus_scale = exit_bonus_scale
         self.action_cooldown_bars = action_cooldown_bars
+        self.bar_period_seconds = bar_period_seconds
 
         self.model_name = "QAgent-Model-{}.keras"
         self.model_online = None
@@ -112,7 +114,6 @@ class DQTPAgent(BaseAgent):
         self.loss_tracker, self.loss_tracker_n = 0.0, 0
         self.q_value_tracker, self.q_value_diff_tracker, self.q_value_tracker_n = 0.0, 0, 0
         self.reward_tracker, self.reward_tracker_n = 0.0, 0
-        self.market_log_change_tracker, self.market_log_change_tracker_n = 0.0, 0
 
     def load_config(self):
         try:
@@ -165,7 +166,7 @@ class DQTPAgent(BaseAgent):
                 if trade:
                     cdt = datetime.fromisoformat(state["state_global"]["account"]["current_datetime"])
                     entry_dt = datetime.fromisoformat(trade[0]["datetime"])
-                    bars_held = (cdt - entry_dt).total_seconds() / (15 * 60)
+                    bars_held = (cdt - entry_dt).total_seconds() / self.bar_period_seconds
                     if bars_held < self.action_cooldown_bars:
                         pa[0] = 0.0 # Disable FLAT
         return pa
@@ -197,13 +198,6 @@ class DQTPAgent(BaseAgent):
         actions = {}
         for sy in symbols:
             pa = self._possible_actions(sy, state)
-
-            # Per-bar exploration (standard DQN epsilon-greedy).
-            # NOTE: Episodic exploration (suppressing exploration when LONG) was tried
-            # in the F-series and caused catastrophic hyper-trading — the Q-network
-            # itself exits at the cooldown boundary without random noise to break the
-            # position-feature feedback loop. Reverted to per-bar exploration.
-            # Instead, expl_min is lowered to allow longer holds naturally.
 
             # exploration or model agent prediction
             if self.model_online is None or (
@@ -268,8 +262,6 @@ class DQTPAgent(BaseAgent):
             price_current = state["state_symbol"][sy]["ohlcv"]["close"][-1]
             price_future = state_future["state_symbol"][sy]["ohlcv"]["close"][-1]
             reward[sy]["market_log_return"] = np.log(price_future / price_current)
-            self.market_log_change_tracker += reward[sy]["market_log_return"]
-            self.market_log_change_tracker_n += 1
 
             # Commission as fraction of position notional
             p_t = 1.0 if action[sy]["action_private"] == self.ACTION_LONG else 0.0
@@ -348,14 +340,25 @@ class DQTPAgent(BaseAgent):
 
         return run_learn
 
-    # Lookback indices: 15m, 1h, 4h on 15-minute bars
-    _LOOKBACKS = [1, 4, 16]
+    # Lookback indices: 1h, 24h (1 day), 72h (3 days) on 1H bars
+    _LOOKBACKS = [1, 24, 72]
+
+    # PnL trajectory lookbacks (1h, 4h, 12h) — only active when hold_bars >= lookback
+    _PNL_LOOKBACKS = [1, 4, 12]
 
     # Bridge Bands state keys (micro → daily → weekly)
     _BB_KEYS = ["bridge_bnds_micro", "bridge_bnds_daily", "bridge_bnds_weekly"]
 
     # MACD state keys (micro → daily → weekly)
-    _MACD_KEYS = ["macd_12_26_9", "macd_96_288_96", "macd_480_960_192"]
+    _MACD_KEYS = ["macd_6_13_4", "macd_24_72_24", "macd_112_240_48"]
+
+    # Trend Maturity state key
+    _TM_KEY = "trend_maturity"
+    _TM_FEATURES = [
+        "tm_direction", "tm_exhaustion", "tm_bull_waves", "tm_bear_waves",
+        "tm_extending", "tm_retrace_depth", "tm_impulse_ratio",
+        "tm_dir_bias", "tm_efficiency",
+    ]
 
     def _generate_example(self, symbol: str, state: dict) -> list:
         ex = []
@@ -369,19 +372,16 @@ class DQTPAgent(BaseAgent):
         ohlcv = sym_state["ohlcv"]
         price = ohlcv["close"][-1]
 
+        closes = ohlcv["close"]
         cs_open = ohlcv["open"][-1]
         cs_high = ohlcv["high"][-1]
         cs_low = ohlcv["low"][-1]
 
-        # ── TIME (6 features) ──
+        # ── TIME (2 features) ──
         ex.append(math.cos(math.pi * cdt.weekday() / 3))
         ex.append(math.sin(math.pi * cdt.weekday() / 3))
-        ex.append(math.cos(2 * math.pi * cdt.hour / 24))
-        ex.append(math.sin(2 * math.pi * cdt.hour / 24))
-        ex.append(math.cos(2 * math.pi * cdt.minute / 60))
-        ex.append(math.sin(2 * math.pi * cdt.minute / 60))
 
-        # ── POSITION (5 features) ──
+        # ── POSITION (6 features) ──
         ex.append(0.0 if not pos else float(np.sign(pos["size"])))
 
         if not pos:
@@ -394,22 +394,27 @@ class DQTPAgent(BaseAgent):
                 * math.log1p(100 * abs(return_on_position))
             )
 
-        ex.append(0.0 if not pos else math.log1p(len(trade)))
-
-        if trade:
-            trade_end_dt = to_dt(trade[-1]["datetime"])
-            days_since_last = abs((cdt - trade_end_dt).total_seconds()) / 86400.0
-            ex.append(0.0 if not pos else math.exp(-days_since_last / 28.0))
-
-            if pos:
-                trade_start_dt = to_dt(trade[0]["datetime"])
-                days_since_start = abs((cdt - trade_start_dt).total_seconds()) / 86400.0
-                ex.append(math.exp(-days_since_start / 28.0))
-            else:
-                ex.append(-1.0 * math.exp(-days_since_last / 28.0))
+        # Hold duration normalized (0=flat, 1.0=hold cost threshold, max 5.0)
+        if pos and trade:
+            trade_start_dt = to_dt(trade[0]["datetime"])
+            hold_hours = abs((cdt - trade_start_dt).total_seconds()) / 3600.0
+            ex.append(min(hold_hours, 360.0) / 72.0)
         else:
+            hold_hours = 0.0
             ex.append(0.0)
-            ex.append(0.0)
+
+        # PnL trajectory at [1, 4, 12] bar lookbacks (relative to entry price)
+        if pos and trade:
+            entry_price = (pos["value"] - pos["profit"]) / (abs(pos["size"]) + 1e-8)
+            hold_bars = hold_hours  # 1H bars, so hold_hours == hold_bars
+            for i in self._PNL_LOOKBACKS:
+                if hold_bars >= i:
+                    ex.append(math.log(closes[-i] / (entry_price + 1e-8)) * 100)
+                else:
+                    ex.append(0.0)
+        else:
+            for _ in self._PNL_LOOKBACKS:
+                ex.append(0.0)
 
         # ── VOL-NORMALIZED OHLC (3 features) ──
         bb_micro = sym_state["bridge_bnds_micro"]
@@ -423,13 +428,12 @@ class DQTPAgent(BaseAgent):
         ex.append(abs(price - cs_open) / full_range)
 
         # ── LOG-RETURNS (3 features) ──
-        closes = ohlcv["close"]
         for i in self._LOOKBACKS:
             ex.append(math.log(closes[-1] / (closes[-1 - i] + 1e-8)) * 100)
 
         # ── RELATIVE VOLUME (3 features) ──
         volumes = ohlcv["volume"]
-        vol_mean = np.mean(volumes[-16:]) + 1e-8
+        vol_mean = np.mean(volumes[-self._LOOKBACKS[-1]:]) + 1e-8
         for i in self._LOOKBACKS:
             ex.append(math.log1p(volumes[-i] / vol_mean))
 
@@ -444,11 +448,6 @@ class DQTPAgent(BaseAgent):
                 ex.append(bb_pos[-i])
                 ex.append(bb_hexp[-i])
 
-        # ── BB POSITION VELOCITY (3 features) ──
-        for bb_key in self._BB_KEYS:
-            bb_pos = sym_state[bb_key]["bridge_bands_pos"]
-            ex.append(bb_pos[-1] - bb_pos[-4])
-
         # ── MACD × 3 scales (6 features each = 18 total) ──
         for macd_key in self._MACD_KEYS:
             macd = sym_state[macd_key]
@@ -458,9 +457,14 @@ class DQTPAgent(BaseAgent):
                 ex.append(m_macd[-i])
                 ex.append(m_hist[-i])
 
+        # ── TREND MATURITY (9 features, current bar only) ──
+        tm = sym_state[self._TM_KEY]
+        for feat in self._TM_FEATURES:
+            ex.append(tm[feat][-1])
+
         return ex
 
-    _REWARD_SCALE = 150.0  # targets ~90% of rewards in [-1, 1] for BTC 15m σ≈0.004
+    _REWARD_SCALE = 75.0  # targets ~92% of rewards in [-1, 1] for BTC 1H (empirically verified)
     _HOLD_THRESHOLD_HOURS = 72.0  # 3 days free hold, then cost ramps
     _HOLD_COST_POWER = 1.5  # power-law ramp after threshold
     _EXIT_BONUS_CAP = 3.0  # max positive exit bonus

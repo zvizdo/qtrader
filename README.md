@@ -30,9 +30,9 @@ A deep Q-learning trading agent for Bitcoin (BTCUSD) built on top of QuantConnec
 
 ## Architecture Overview
 
-At the top level, an **Optuna study** searches over hyperparameters. Each trial spins up a **trainer** that runs hundreds of LEAN backtests — every backtest is a full episode where the agent observes 15-minute bars, decides to go long or stay flat, and learns from the outcome via experience replay. Between episodes, the trainer samples random date windows, decays exploration, and periodically evaluates on a held-out period.
+At the top level, an **Optuna study** searches over hyperparameters. Each trial spins up a **trainer** that runs hundreds of LEAN backtests — every backtest is a full episode where the agent observes 1-hour bars, decides to go long or stay flat, and learns from the outcome via experience replay. Between episodes, the trainer samples random date windows, decays exploration, and periodically evaluates on a held-out period.
 
-Inside each backtest the heavy lifting happens in four stages that fire on every consolidated bar: **state providers** (Bridge Bands, MACD, OHLCV, volume, position & account features) produce a 70-dim observation → the **DQTP agent** picks an action via ε-greedy Double DQN → the **feedback module** computes a shaped reward from log-returns and a holding penalty → the **learning step** samples a prioritized mini-batch and updates the online network. A pre-computed **golden cache** (diskcache.Index) ensures indicator values are calculated only once across all runs.
+Inside each backtest the heavy lifting happens in four stages that fire on every consolidated bar: **state providers** (Bridge Bands, MACD, Trend Maturity, OHLCV, volume, position & account features) produce a 71-dim observation → the **DQTP agent** picks an action via ε-greedy Double DQN → the **feedback module** computes a shaped reward from log-returns, holding cost, and trade-completion bonus → the **learning step** samples a prioritized mini-batch and updates the online network. A pre-computed **golden cache** (diskcache.Index) ensures indicator values are calculated only once across all runs.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -49,7 +49,7 @@ Inside each backtest the heavy lifting happens in four stages that fire on every
 │                                              │
 │  ┌────────────┐   ┌───────────────────────┐  │
 │  │ Market Env │──▶│  RL Pipeline          │  │
-│  │ (15m OHLCV)│   │  State → Act →        │  │
+│  │ (1H OHLCV) │   │  State → Act →        │  │
 │  └────────────┘   │  Feedback → Learn     │  │
 │                   └──────────┬────────────┘  │
 │                              │               │
@@ -98,7 +98,7 @@ qtrader/
 │   ├── stateproviders/
 │   │   ├── __init__.py         # Base classes
 │   │   ├── basic.py            # Account, Position, Trade, OHLCV providers
-│   │   ├── indicators.py       # Bridge Bands, MACD, Trendlines
+│   │   ├── indicators.py       # Bridge Bands, MACD, Trend Maturity, Trendlines
 │   │   └── model.py            # ML-based providers
 │   │
 │   ├── rlflow/
@@ -166,14 +166,14 @@ python qtrader_warmup.py \
     --golden-cache-dir ../storage/cache
 ```
 
-This runs `main.py` in `WARMUP` mode — it walks through every 15-minute bar, computes all state providers (Bridge Bands, MACD, OHLCV features), and writes the results to a `diskcache.Index` directory. The date range is split into chunks and processed in parallel via separate Docker containers, then merged into a single index.
+This runs `main.py` in `WARMUP` mode — it walks through every 1-hour bar, computes all state providers (Bridge Bands, MACD, Trend Maturity, OHLCV features), and writes the results to a `diskcache.Index` directory. The date range is split into chunks and processed in parallel via separate Docker containers, then merged into a single index.
 
 **What gets cached:**
 
 - Bridge Bands (micro / daily / weekly scales)
 - MACD (micro / daily / weekly scales)
+- Trend Maturity (swing-structure features)
 - OHLCV features
-- Account and position state snapshots
 
 **Cache key format:** `Flow-State-{symbol}-{YYYYMMDDHHMM}-{ProviderClass}-{ParamsHash}`
 
@@ -192,9 +192,9 @@ python qtrader_trainer.py \
 
 **What happens per iteration:**
 
-1. A random 3-year date window is sampled from the historical data
+1. A random 140-day date window is sampled from the historical data (2016–2023)
 2. The golden cache directory is mounted as a read-through cache provider
-3. LEAN runs a backtest (`main.py` in `TRAIN` mode) — the agent observes 15-minute bars, takes actions, and learns via experience replay
+3. LEAN runs a backtest (`main.py` in `TRAIN` mode) — the agent observes 1-hour bars, takes actions, and learns via experience replay
 4. Every `n_test` iterations (default 5), an evaluation run executes on a held-out period with frozen weights
 
 **Passing hyperparameters** — use `-p key=value` pairs:
@@ -273,21 +273,21 @@ The algorithm (`main.py`) supports four modes, controlled by the `run_type` para
 
 ### RL Pipeline
 
-On every 15-minute consolidated bar, the pipeline executes:
+On every 1-hour consolidated bar, the pipeline executes:
 
 ```
 State Providers    →    Aggregation    →    Agent Act    →    Feedback & Learn
-(indicators,            (70-dim feature     (ε-greedy        (reward calc,
+(indicators,            (71-dim feature     (ε-greedy        (reward calc,
  position info,          vector)             action           experience replay,
  account info)                               selection)       weight update)
 ```
 
 **Step by step:**
 
-1. **State computation** — each state provider (Bridge Bands, MACD, OHLCV, position, account) runs and its output is cached
-2. **Aggregation** — all provider outputs are combined into a flat 70-dimensional feature vector
+1. **State computation** — each state provider (Bridge Bands, MACD, Trend Maturity, OHLCV, position, account) runs and its output is cached
+2. **Aggregation** — all provider outputs are combined into a flat 71-dimensional feature vector
 3. **Action** — the agent picks `FLAT` (exit/hold) or `LONG` (enter/hold) via ε-greedy policy
-4. **Feedback** — reward is computed from market return, trade cost, and drawdown penalty
+4. **Feedback** — reward is computed from market return, trade cost, holding cost, and trade-completion bonus
 5. **Learn** — every `n_step_update` steps, the agent samples a mini-batch from the replay buffer and updates the online network
 
 ### Agent (DQTP)
@@ -319,68 +319,62 @@ The agent is a **Double DQN** with **Prioritized Experience Replay**:
 | `model_l2_reg`        | 0.0      | L2 regularization strength                        |
 | `invest_pct`          | 0.02     | Fraction of account value per trade               |
 
-Note: the target network is updated on **every learning step** (not on a separate schedule), making `target_tau` the primary knob for controlling target lag. Q-value targets are clipped to [-15, 15] and TD errors are clipped to [0, 5] to prevent runaway bootstrapping.
+Note: the target network is updated on **every learning step** (not on a separate schedule), making `target_tau` the primary knob for controlling target lag. Q-value targets are clipped to `±1.5/(1-γ)` and TD errors are clipped to [0, 5] to prevent runaway bootstrapping.
 
 ### Feature Engineering
 
-The agent observes a **70-dimensional** feature vector built from multi-timeframe indicators:
+The agent observes a **71-dimensional** feature vector built from multi-timeframe indicators:
 
 | Group                    | Features | Description                                              |
 |-------------------------|----------|----------------------------------------------------------|
-| Time encoding            | 6        | sin/cos of weekday, hour, minute                         |
-| Position info            | 5        | sign, ROE (position-relative), trade count, days since/in trade |
-| OHLC (normalized)        | 3        | open/high/low relative to close, scaled by BB width      |
+| Time encoding            | 2        | sin/cos of weekday (π/3 period)                          |
+| Position info            | 5        | sign, ROE, trade count, days since last/first order      |
+| OHLC (normalized)        | 3        | open/high/low relative to close, scaled by BB micro width |
 | Candle body ratio        | 1        | abs(close-open) / (high-low) — conviction vs indecision  |
-| Log-returns              | 3        | raw log-return at 1, 4, 16 bars back (×100)              |
-| Relative volume          | 3        | log1p(volume / mean_16) at 1, 4, 16 bars back            |
+| Log-returns              | 3        | raw log-return at 1, 24, 72 bars back (×100)             |
+| Relative volume          | 3        | log1p(volume / mean_72) at 1, 24, 72 bars back           |
 | Bridge Bands (×3 scales) | 27       | band width, band position, Hurst exponent at 3 lookbacks |
-| BB position velocity     | 3        | 4-bar change in band position per scale                  |
 | MACD (×3 scales)         | 18       | MACD value and histogram at 3 lookbacks                  |
-| **Total**                | **70**   |                                                          |
+| Trend Maturity           | 9        | direction, exhaustion, wave counts, efficiency, etc.     |
+| **Total**                | **71**   |                                                          |
 
 **Multi-timeframe scales:**
 
-| Scale  | Bridge Bands Lookback | MACD (short/long/signal) | Captures            |
-|--------|----------------------|--------------------------|---------------------|
-| Micro  | 14 bars (3.5h)       | 12 / 26 / 9             | Intraday volatility  |
-| Daily  | 96 bars (1 day)      | 96 / 288 / 96           | Swing momentum       |
-| Weekly | 480 bars (5 days)    | 480 / 960 / 192         | Macro trend          |
+| Scale  | Bridge Bands Length | MACD (short/long/signal) | Captures            |
+|--------|---------------------|--------------------------|---------------------|
+| Micro  | 12 bars (12h)       | 6 / 13 / 4              | Intraday volatility  |
+| Daily  | 96 bars (4 days)    | 24 / 72 / 24            | Swing momentum       |
+| Weekly | 336 bars (14 days)  | 112 / 240 / 48          | Macro trend          |
 
-Each indicator is also observed at **3 lookback windows** (1, 4, 16 bars back), giving the agent a sense of feature trajectory.
+**Trend Maturity** uses `swing_order=7` (7h each side) with a 120-bar (5-day) lookback. It produces 9 features per bar: direction, exhaustion, bull/bear wave counts, extending flag, retracement depth, impulse ratio, directional bias, and efficiency ratio.
+
+Each indicator is also observed at **3 lookback windows** (1, 24, 72 bars back), giving the agent a sense of feature trajectory.
 
 ### Reward Function
 
 ```
-R(t) = P(t) × log_return × scale
-     - comm_frac × scale
-     - P(t) × α_dd × max(-ROE, 0)
+R(t) = P(t) × clip(log_return × 75, -1, 1) - P(t) × hold_cost
+     - comm_frac × 75
+     + exit_bonus
 ```
 
-Three independent terms:
+Four components:
 
-1. **Market return** — only received while LONG, gated by P(t)
-2. **Trade cost** — commission penalty applied on every position change (entry *and* exit), independent of P(t)
-3. **Drawdown penalty** — proportional to how underwater the current position is; winning positions incur zero penalty regardless of hold duration
+1. **Market return** — clipped log-return scaled by 75, only received while LONG
+2. **Holding cost** — zero for the first 72h, then ramps as `hold_cost_scale × ((hours-72)/24)^1.5`
+3. **Trade cost** — commission as a fraction of position notional, scaled by 75
+4. **Exit bonus** — lump-sum on trade exit: `min(pnl_pct × exit_bonus_scale, 3.0)` for profit, `max(pnl_pct × exit_bonus_scale, -2.0)` for loss
 
 Where:
 
-- **P(t)** = 1 if in a LONG position, 0 if FLAT
-- **log_return** = log(price_t / price_{t-1})
-- **comm_frac** = commission / position notional (position-relative, not account-relative)
-- **ROE** = unrealized profit / cost basis of the current position
-- **scale** = 150 (targets ~90% of raw rewards in [-1, 1] for BTC 15-minute σ ≈ 0.004)
-- **α_dd** = 5.0 (drawdown penalty coefficient)
+- **P(t)** = 1 if in a LONG position, 0 if FLAT. **R_flat = 0** (no flat penalty — eliminates death spiral)
+- **log_return** = log(price_future / price_current)
+- **comm_frac** = commission / position notional
+- **hold_cost_scale** = 0.05 (tunable)
+- **exit_bonus_scale** = 50.0 (tunable)
+- **Scale** = 75.0 (targets ~92% of rewards in [-1, 1] for BTC 1H bars)
 
-Drawdown penalty at typical ROE levels (vs a ±0.6 typical bar reward):
-
-| Position ROE | Penalty | Relative to bar |
-|---|---|---|
-| -1% | 0.05 | ~8% — gentle nudge |
-| -5% | 0.25 | ~40% — real pressure |
-| -10% | 0.50 | ~80% — strong exit signal |
-| ≥ 0% | 0.00 | no penalty |
-
-The commission is measured relative to the position notional (`commission / (account_value × invest_pct)`), making it directly comparable to the market log-return regardless of position sizing.
+The holding cost creates time pressure to exit stale positions while the exit bonus rewards profitable trade completion, encouraging the agent to hold through short-term noise when the trade thesis remains valid.
 
 ### Caching & Persistence
 
@@ -413,7 +407,7 @@ QTrader runs as a standard QuantConnect LEAN algorithm. The entry point is `main
 | LEAN Feature          | Usage in QTrader                                       |
 |----------------------|--------------------------------------------------------|
 | `add_crypto()`       | Subscribes to BTCUSD at minute resolution              |
-| `TradeBarConsolidator` | Consolidates 1-minute bars into 15-minute bars       |
+| `TradeBarConsolidator` | Consolidates 1-minute bars into 1-hour bars          |
 | `history()`          | Retrieves historical OHLCV for indicator warmup        |
 | `market_order()`     | Executes BUY/SELL orders                               |
 | `liquidate()`        | Closes open positions                                  |

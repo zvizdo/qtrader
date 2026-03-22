@@ -138,11 +138,11 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
     # --- Training and Evaluation Period Config ---
     train_period_start = datetime(2016, 1, 1)
     train_period_end = datetime(2023, 1, 1) # Approximate 7 years from start
-    train_sample_duration_days = 35
+    train_sample_duration_days = 140
 
     eval_period_start = datetime(2023, 2, 1)
     eval_period_end = datetime(2026, 1, 31)
-    eval_sample_duration_days = 70
+    eval_sample_duration_days = 280
 
     run_params = {"run_type": "EVAL", "hyperparams": params}
 

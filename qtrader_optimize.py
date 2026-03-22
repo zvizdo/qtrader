@@ -20,28 +20,28 @@ def objective(trial):
         iters=500,
         params={
             # ===== STATIC =====
-            "invest_pct": (0.05, 0.5),
+            "invest_pct": 0.25,
             "eval_invest_pct": 0.25,
             "expl_decay": 0.9925,
-            "n_steps_warmup": 10_000,
-            "n_step_update": 16, # 96 is once per day
+            "n_steps_warmup": 2_500,
+            "n_step_update": 4, # 24 is once per day on 1H bars
             "model_n_layers": 1,
-            "model_fl_size":  64, # 128,
+            "model_fl_size":  64,
             "model_shape": "flat",
-            "exp_memory_size": 50_000, # 365 * 96 * 7 * 2, # 365 * 10_000,
-            "exp_mini_batch_size": 256, 
+            "exp_memory_size": 50_000,
+            "exp_mini_batch_size": 256,
             "exp_w_inc": 1e-5,
-            "action_cooldown_bars": 8,
+            "action_cooldown_bars": 2,
             # ===== TUNED =====
             "expl_min": trial.suggest_float("expl_min", 0.01, 0.10, step=0.01),
-            "n_steps_checkpoint": trial.suggest_int("n_steps_checkpoint", 500, 2_000, step=250),
+            "n_steps_checkpoint": trial.suggest_int("n_steps_checkpoint", 125, 500, step=125),
             "exp_alpha": trial.suggest_float("exp_alpha", 0.4, 0.8, step=0.1),
             "hold_cost_scale": trial.suggest_categorical("hold_cost_scale", [0.03, 0.05, 0.10]),
             "exit_bonus_scale": trial.suggest_categorical("exit_bonus_scale", [30.0, 50.0, 80.0]),
             # ===== LOCKED =====
             "exp_weighting": 0.4,
             "model_lr": 1e-5,
-            "rl_gamma": 0.97,
+            "rl_gamma": 0.986,
             "target_tau": 0.005,
         },
         n_test=10,
