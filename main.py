@@ -101,8 +101,10 @@ class QTraderAlgorithm(QCAlgorithm):
             ],  # model related
             rl_gamma=float(params.get("rl_gamma", 0.9)),
             target_tau=float(params.get("target_tau", 0.001)),
-            hold_cost_scale=float(params.get("hold_cost_scale", 0.05)),
-            exit_bonus_scale=float(params.get("exit_bonus_scale", 50.0)),
+            hold_cost_scale=float(params.get("hold_cost_scale", 0.085)),
+            exit_bonus_scale=float(params.get("exit_bonus_scale", 5.0)),
+            exit_loss_ratio=float(params.get("exit_loss_ratio", 0.7)),
+            duration_bonus_scale=float(params.get("duration_bonus_scale", 0.0)),
             action_cooldown_bars=int(params.get("action_cooldown_bars", 0)),
             bar_period_seconds=int(self.BAR_PERIOD.total_seconds()),
         )

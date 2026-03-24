@@ -11,6 +11,7 @@ if __name__ == '__main__':
     parser.add_argument("--name", help="Study name", type=str, default='study-test')
     parser.add_argument("--num-trials", help="Number of trials to run", type=int, default=10)
     parser.add_argument("--path", help="Study path", type=str, default='trial.db')
+    parser.add_argument("--iters", help="Training iterations per trial", type=int, default=150)
 
     args = parser.parse_args()
     print(args)
@@ -18,6 +19,7 @@ if __name__ == '__main__':
     study_name = args.name
     num_trials = args.num_trials
     path = args.path
+    iters = args.iters
 
     # Fix #4: ensure the log directory exists before writing
     os.makedirs('./backtests/logs', exist_ok=True)
@@ -49,7 +51,8 @@ if __name__ == '__main__':
                 ["python", "qtrader_optimize.py",
                  "--name", study_name,
                  "--path", path,
-                 "--num-trials", "1"],
+                 "--num-trials", "1",
+                 "--iters", str(iters)],
                 stdout=pid_logs,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True

@@ -44,9 +44,11 @@ class DQTPAgent(BaseAgent):
         model_layers=[32],
         model_act_func="elu",  # model related
         rl_gamma=0.9,
-        hold_cost_scale=0.05,
-        exit_bonus_scale=50.0,
+        hold_cost_scale=0.085,
+        exit_bonus_scale=5.0,
+        exit_loss_ratio=1.0,
         action_cooldown_bars=0,
+        duration_bonus_scale=0.0,
         bar_period_seconds=3600,
         no_learn=False,
         no_full_state=True,
@@ -83,7 +85,9 @@ class DQTPAgent(BaseAgent):
         self.rl_gamma = rl_gamma
         self.hold_cost_scale = hold_cost_scale
         self.exit_bonus_scale = exit_bonus_scale
+        self.exit_loss_ratio = exit_loss_ratio
         self.action_cooldown_bars = action_cooldown_bars
+        self.duration_bonus_scale = duration_bonus_scale
         self.bar_period_seconds = bar_period_seconds
 
         self.model_name = "QAgent-Model-{}.keras"
@@ -378,8 +382,9 @@ class DQTPAgent(BaseAgent):
         cs_low = ohlcv["low"][-1]
 
         # ── TIME (2 features) ──
-        ex.append(math.cos(math.pi * cdt.weekday() / 3))
-        ex.append(math.sin(math.pi * cdt.weekday() / 3))
+        week_pos = cdt.weekday() + cdt.hour / 24.0
+        ex.append(math.cos(math.pi * week_pos / 3))
+        ex.append(math.sin(math.pi * week_pos / 3))
 
         # ── POSITION (6 features) ──
         ex.append(0.0 if not pos else float(np.sign(pos["size"])))
@@ -464,23 +469,27 @@ class DQTPAgent(BaseAgent):
 
         return ex
 
-    _REWARD_SCALE = 75.0  # targets ~92% of rewards in [-1, 1] for BTC 1H (empirically verified)
+    _REWARD_SCALE = 75.0  # targets ~93% of rewards in [-1, 1] for BTC 1H
+    _R_BAR = 0.59  # sigma_1h × REWARD_SCALE — the per-bar noise floor
     _HOLD_THRESHOLD_HOURS = 72.0  # 3 days free hold, then cost ramps
     _HOLD_COST_POWER = 1.5  # power-law ramp after threshold
-    _EXIT_BONUS_CAP = 3.0  # max positive exit bonus
-    _EXIT_LOSS_CAP = -2.0  # max negative exit penalty
-    _EXIT_LOSS_RATIO = 1.0  # loss_scale = exit_bonus_scale × this ratio
+    _TRADE_PNL_REF = 0.03  # median |trade_pnl_pct| for tanh normalization
+    _DURATION_PEAK_DAYS = 3.0  # reverse-U peak for duration bonus
+    _DURATION_HALF_WIDTH = 2.0  # half-width: bonus spans peak ± this (1d to 5d)
 
     def _generate_reward(self, rewards):
         """Active trader reward: clipped market return + hold duration cost + exit bonus."""
         return np.array([self._reward_active(re) for re in rewards])
 
     def _reward_active(self, re):
-        """Combined duration cost (Option A) + exit bonus (Option B).
+        """Sigma-anchored reward with tanh-compressed exit bonus.
+
+        All shaping components (hold_cost, exit_bonus, duration_bonus) are in
+        R_bar units (sigma × REWARD_SCALE ≈ 0.59) and disable when scale=0.
 
         LONG: clipped market return − hold cost (ramps after 72h)
-        FLAT: 0 (no penalty — eliminates death spiral)
-        Exit bar: lump-sum bonus/penalty based on full trade PnL%
+        FLAT: 0 (no penalty)
+        Exit bar: tanh-compressed PnL bonus + duration bonus (reverse-U, peak 3d)
         """
         p_t = 1.0 if re["action_private"] == self.ACTION_LONG else 0.0
         market_return = np.clip(
@@ -488,27 +497,38 @@ class DQTPAgent(BaseAgent):
         )
         trade_cost = re.get("comm_frac", 0.0) * self._REWARD_SCALE
 
-        # Duration-based holding cost: free for first 72h, then power-law ramp
+        # Hold cost: free until threshold, then power-law ramp in R_bar units
         hold_hours = re.get("hold_hours", 0.0)
-        if hold_hours > self._HOLD_THRESHOLD_HOURS:
+        hold_cost = 0.0
+        if self.hold_cost_scale > 0 and hold_hours > self._HOLD_THRESHOLD_HOURS:
             excess_days = (hold_hours - self._HOLD_THRESHOLD_HOURS) / 24.0
-            hold_cost = self.hold_cost_scale * excess_days ** self._HOLD_COST_POWER
-        else:
-            hold_cost = 0.0
+            hold_cost = self.hold_cost_scale * self._R_BAR * excess_days ** self._HOLD_COST_POWER
 
-        # Trade-completion bonus: only on exit bar
+        # Exit bonus + duration bonus: both fire once on trade exit
         exit_bonus = 0.0
+        duration_bonus = 0.0
         trade_pnl_pct = re.get("trade_pnl_pct", None)
         if trade_pnl_pct is not None:
-            if trade_pnl_pct > 0:
-                exit_bonus = min(trade_pnl_pct * self.exit_bonus_scale, self._EXIT_BONUS_CAP)
-            else:
-                loss_scale = self.exit_bonus_scale * self._EXIT_LOSS_RATIO
-                exit_bonus = max(trade_pnl_pct * loss_scale, self._EXIT_LOSS_CAP)
+            # PnL-based exit bonus (tanh compression, peak = exit_bonus_scale × R_bar)
+            if self.exit_bonus_scale > 0:
+                x = trade_pnl_pct / self._TRADE_PNL_REF
+                if trade_pnl_pct >= 0:
+                    exit_bonus = self.exit_bonus_scale * self._R_BAR * math.tanh(x)
+                else:
+                    exit_bonus = self.exit_bonus_scale * self.exit_loss_ratio * self._R_BAR * math.tanh(x)
+
+            # Duration bonus: one-time at exit, reverse-U peaking at 3d
+            if self.duration_bonus_scale > 0:
+                hold_days = hold_hours / 24.0
+                w = self._DURATION_HALF_WIDTH
+                peak = self._DURATION_PEAK_DAYS
+                if abs(hold_days - peak) < w:
+                    duration_bonus = self.duration_bonus_scale * self._R_BAR * (
+                        1.0 - ((hold_days - peak) / w) ** 2
+                    )
 
         R_long = market_return - hold_cost
-        R_flat = 0.0  # no flat penalty
-        return p_t * R_long - trade_cost + (1.0 - p_t) * R_flat + exit_bonus
+        return p_t * R_long - trade_cost + exit_bonus + duration_bonus
 
     def _generate_examples_from_state(self, sf) -> Optional[tuple]:
         state = self.pprovider.load_dict(name=sf) if not isinstance(sf, dict) else sf

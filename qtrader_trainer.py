@@ -8,7 +8,6 @@ import argparse
 import ast
 import click
 import json
-import optuna
 from lean.commands.backtest import backtest as run_lean_backtest
 from lean.commands.report import report as run_report
 from datetime import datetime, timedelta
@@ -235,28 +234,8 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
         logger.log_eval_step(step=step, stats=stats)
         # endregion
 
-        if not is_last_iter:
-            # Multi-metric hard prune (only when running inside Optuna)
-            if prune is not None and step >= 200:
-                port_stats = stats.get("totalPerformance", {}).get("portfolioStatistics", {})
-                sharpe = float(port_stats.get("sharpeRatio", 0))
-                drawdown = float(port_stats.get("drawdown", 0))
-                num_trades = len(stats.get("orders", {}).keys())
-
-                # if num_trades <= 10 or drawdown > 0.5 or sharpe < -1.0:
-                #     raise optuna.TrialPruned()
-
-            # Percentile-based pruning via Optuna callback
-            if prune is not None and callable(prune):
-                recent_sharpes = [
-                    float(s["totalPerformance"]["portfolioStatistics"]["sharpeRatio"])
-                    for s in eval_stats[-5:]
-                ]
-                w = np.array([0.45, 0.25, 0.15, 0.1, 0.05][:len(recent_sharpes)])
-                w = w / np.sum(w)
-                weighted_sharpe = float(np.sum(np.array(recent_sharpes[::-1]) * w))
-                
-                prune(weighted_sharpe, step)
+        if not is_last_iter and prune is not None and callable(prune):
+            prune(eval_stats, step)
 
     logger.close()
     return stats

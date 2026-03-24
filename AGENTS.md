@@ -152,26 +152,29 @@ Optimizer: Adam(lr=model_lr)
 
 State keys in `sym_state`: `bridge_bnds_micro`, `bridge_bnds_daily`, `bridge_bnds_weekly`, `macd_6_13_4`, `macd_24_72_24`, `macd_112_240_48`, `trend_maturity`
 
-### Reward Function (`_reward_active`, L474-507)
+### Reward Function (`_reward_active`)
+
+All shaping components are anchored to `_R_BAR = sigma_1h × REWARD_SCALE ≈ 0.59` (the per-bar noise floor). Each component disables when its scale=0.
 
 ```python
-R = p_t * (clip(market_log_return * 75, -1, 1) - hold_cost) - trade_cost + exit_bonus
+R = p_t * (clip(market_log_return * 75, -1, 1) - hold_cost) - trade_cost + exit_bonus + duration_bonus
 ```
 
 - `p_t` = 1 if LONG, 0 if FLAT. **R_flat = 0** (no flat penalty)
 - `trade_cost = comm_frac * 75` (only on position changes)
-- `hold_cost`: 0 if hold_hours <= 72h, else `hold_cost_scale * ((hours-72)/24)^1.5`
-- `exit_bonus`: on trade exit only, `min(pnl_pct * exit_bonus_scale, 3.0)` for profit, `max(pnl_pct * exit_bonus_scale * 1.0, -2.0)` for loss
+- `hold_cost`: 0 if hold_hours ≤ 72h, else `hold_cost_scale * R_BAR * ((hours-72)/24)^1.5`
+- `exit_bonus` (on trade exit only): `exit_bonus_scale * R_BAR * tanh(trade_pnl_pct / 0.03)` for profit; losses scaled by `exit_loss_ratio`
+- `duration_bonus` (on trade exit only): reverse-U peaking at 3d hold, `duration_bonus_scale * R_BAR * (1 - ((days-3)/2)^2)` if hold in [1d, 5d]
 
 **Locked constants** (class attrs):
-- `_REWARD_SCALE = 75.0`
+- `_REWARD_SCALE = 75.0` — scales log returns, ~93% coverage in [-1, 1]
+- `_R_BAR = 0.59` — sigma × REWARD_SCALE, the core unit for all shaping
+- `_TRADE_PNL_REF = 0.03` — median |trade_pnl_pct|, normalizes tanh input
 - `_HOLD_THRESHOLD_HOURS = 72.0`
 - `_HOLD_COST_POWER = 1.5`
-- `_EXIT_BONUS_CAP = 3.0`
-- `_EXIT_LOSS_CAP = -2.0`
-- `_EXIT_LOSS_RATIO = 1.0`
+- `_DURATION_PEAK_DAYS = 3.0`, `_DURATION_HALF_WIDTH = 2.0`
 
-**Tunable** (instance attrs): `hold_cost_scale`, `exit_bonus_scale`
+**Tunable** (instance attrs, all in R_bar units): `hold_cost_scale`, `exit_bonus_scale`, `exit_loss_ratio`, `duration_bonus_scale`
 
 ### Reward Enrichment (`feedback`, L246-323)
 
@@ -282,3 +285,18 @@ All cached providers use `cache_truncate=73` to support `_LOOKBACKS[-1]=72`.
 - Each chunk writes to isolated diskcache, then merged into golden cache sequentially
 - Default range: 2016-01-01 to 2026-02-01
 - **Note:** Warmup cache must be fully regenerated after any change to BB/MACD/TrendMaturity parameters or bar period, as cache keys include parameter hashes
+
+## Backtest Analysis (`bt_analysis.py`)
+
+A reusable CLI script to extract, calculate, and format backtest results from a QuantConnect/LEAN output directory into an LLM-optimized Markdown summary.
+
+**Why use this tool?**
+Instead of feeding raw, nested LEAN JSON files into an LLM for analysis—which wastes tokens and can cause hallucinations—this CLI parses the local LEAN data natively. It produces a clean, highly compressed summary with tight key-value pairs, tables, and bullet points so a downstream LLM can understand the backtest performance instantly.
+
+**Usage:**
+```bash
+python bt_analysis.py --dir <path_to_lean_output_folder>
+```
+
+**Options:**
+- `--show-trades`: Include a full trade-by-trade breakdown table (Trade #, Entry Date, Duration, PnL) at the end of the output.
