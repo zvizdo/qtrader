@@ -209,10 +209,12 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
             eval_start = eval_period_start
             eval_end = eval_period_end
         else:
-            eval_start = eval_period_start + timedelta(
-                days=np.random.randint(0, (eval_period_end - eval_period_start).days - eval_sample_duration_days)
-            )
-            eval_end = eval_start + timedelta(days=eval_sample_duration_days)
+            eval_start = datetime(2025, 1, 15)
+            eval_end = datetime(2026, 1, 14)
+            # eval_start = eval_period_start + timedelta(
+            #     days=np.random.randint(0, (eval_period_end - eval_period_start).days - eval_sample_duration_days)
+            # )
+            # eval_end = eval_start + timedelta(days=eval_sample_duration_days)
 
         run_params.update(
             {

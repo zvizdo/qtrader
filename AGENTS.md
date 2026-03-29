@@ -113,7 +113,7 @@ Input (71 features)
   -> Dense(N, activation=model_act_func, GlorotUniform(seed=42))  # repeated per layer
   -> Dense(2, activation='linear')   # Q(FLAT), Q(LONG)
 
-Loss:      Huber(delta=2.0)
+Loss:      Huber(delta=3.0)
 Optimizer: Adam(lr=model_lr)
 ```
 

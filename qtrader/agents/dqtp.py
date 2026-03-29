@@ -410,11 +410,12 @@ class DQTPAgent(BaseAgent):
 
         # PnL trajectory at [1, 4, 12] bar lookbacks (relative to entry price)
         if pos and trade:
-            entry_price = (pos["value"] - pos["profit"]) / (abs(pos["size"]) + 1e-8)
+            entry_price = trade[0]["price"]
             hold_bars = hold_hours  # 1H bars, so hold_hours == hold_bars
             for i in self._PNL_LOOKBACKS:
                 if hold_bars >= i:
-                    ex.append(math.log(closes[-i] / (entry_price + 1e-8)) * 100)
+                    ratio = closes[-i] / (entry_price + 1e-8)
+                    ex.append(math.log(max(ratio, 1e-8)) * 100)
                 else:
                     ex.append(0.0)
         else:
@@ -679,10 +680,10 @@ class DQTPAgent(BaseAgent):
 
         m = tf.keras.Sequential(layers)
         m.compile(
-            loss=tf.keras.losses.Huber(delta=2.0),  # "mse",  # "mse",  # tf.keras.losses.Huber(),
+            loss=tf.keras.losses.Huber(delta=3.0),
             optimizer=tf.keras.optimizers.Adam(
                 learning_rate=self.model_lr,
-                # clipnorm=1.0
+                clipnorm=1.0,
             ),
         )
 

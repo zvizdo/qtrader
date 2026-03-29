@@ -48,8 +48,8 @@ def objective(trial, iters=150):
             # ================================================================
             # LOCKED — Model architecture
             # ================================================================
-            "model_n_layers": 1,
-            "model_fl_size": 64,
+            "model_n_layers": 2,
+            "model_fl_size": 256,
             "model_shape": "flat",
 
             # ================================================================
@@ -73,20 +73,28 @@ def objective(trial, iters=150):
             # ================================================================
             # LOCKED — Update frequency & warmup
             # ================================================================
-            "n_step_update": 8,
+            "n_step_update": trial.suggest_categorical(
+                "n_step_update", [32, 48, 64]
+            ),
             "n_steps_warmup": 5_000,
 
             # ================================================================
             # LOCKED — Exploration schedule
             # ================================================================
-            "expl_decay": 0.9925,
+            "expl_decay": 0.995,
             "expl_min": 0.03,
-            "n_steps_checkpoint": 250,
+            "n_steps_checkpoint": 500,
 
             # ================================================================
-            # LOCKED — Experience replay
+            # TUNED — Experience replay
             # ================================================================
-            "exp_memory_size": 50_000,
+            # Buffer capacity rounds up to nearest power of 2 internally.
+            # 1 iteration = 3,360 bars (140 days)
+            # 16,384  ≈  5 iterations (highly reactive, discards old regimes quickly)
+            # 32,768  ≈ 10 iterations (short memory, smooth locally)
+            # 65,536  ≈ 20 iterations (balanced, good for small capacity networks)
+            # 131,072 ≈ 39 iterations (long memory, highest before off-policy staleness harms learning)
+            "exp_memory_size": 65536,
             "exp_mini_batch_size": 256,
             "exp_alpha": 0.6,
             "exp_weighting": 0.4,
@@ -102,22 +110,29 @@ def objective(trial, iters=150):
             # ================================================================
             # TUNED — Reward shaping (all in R_bar units, 0 = disabled)
             # ================================================================
-            # hold_cost_scale: penalty per excess-day^1.5 past 72h, in R_bar.
-            #   0    = no hold pressure (agent can hold indefinitely)
-            #   0.05 = gentle (5d excess → 0.5σ/bar)
-            #   0.1  = moderate (≈ current calibration)
-            #   0.2  = firm (5d excess → 2σ/bar)
-            #   0.5  = aggressive (5d excess → 5σ/bar)
+            # All peaks capped ≤ 1 R_bar to avoid destabilizing learning.
+            # Previous ranges (up to 8× R_bar) overwhelmed market signal.
+            #
+            # hold_cost_scale: per-bar penalty past 72h, grows as days^1.5.
+            #   Effective R_bar/bar at excess days: scale × [1d:1.0, 2d:2.83, 5d:11.18]
+            #   0     = no hold pressure
+            #   0.005 = whisper (5d excess → 0.06 R_bar/bar)
+            #   0.01  = gentle (5d excess → 0.11 R_bar/bar)
+            #   0.02  = moderate (5d excess → 0.22 R_bar/bar)
+            #   0.05  = firm (5d excess → 0.56 R_bar/bar)
             "hold_cost_scale": trial.suggest_categorical(
-                "hold_cost_scale", [0, 0.05, 0.1, 0.2, 0.5]
+                "hold_cost_scale", [0, 0.005, 0.01, 0.02, 0.05]
             ),
             # exit_bonus_scale: peak tanh-compressed exit bonus in R_bar.
-            #   0 = no exit shaping (pure market return only)
-            #   2 = mild (peak ≈ 1.18)
-            #   5 = moderate (peak ≈ 2.95, current equivalent)
-            #   8 = strong (peak ≈ 4.72)
+            #   Scale value = peak bonus in R_bar units (tanh saturates at 1).
+            #   0    = no exit shaping (pure market return only)
+            #   0.1  = subtle (peak ≈ 0.06)
+            #   0.25 = gentle (peak ≈ 0.15)
+            #   0.5  = moderate (peak ≈ 0.30)
+            #   1.0  = firm (peak ≈ 0.59 = 1 R_bar)
+            #   2.0  = strong (peak ≈ 1.18 = 2 R_bar)
             "exit_bonus_scale": trial.suggest_categorical(
-                "exit_bonus_scale", [0, 2, 5, 8]
+                "exit_bonus_scale", [0, 0.1, 0.25, 0.5, 1.0, 2.0]
             ),
             # exit_loss_ratio: loss penalty as fraction of profit bonus.
             #   0.5 = strong asymmetry (encourage risk-taking)
@@ -127,12 +142,15 @@ def objective(trial, iters=150):
                 "exit_loss_ratio", [0.5, 0.7, 1.0]
             ),
             # duration_bonus_scale: one-time exit bonus for holding 1-5d (peak 3d).
-            #   0   = disabled
-            #   0.5 = mild (peak ≈ 0.30)
-            #   1.0 = moderate (peak = 1σ)
-            #   2.0 = strong (peak ≈ 1.18)
+            #   Scale value = peak bonus in R_bar units.
+            #   0    = disabled
+            #   0.05 = whisper (peak ≈ 0.03)
+            #   0.1  = subtle (peak ≈ 0.06)
+            #   0.25 = gentle (peak ≈ 0.15)
+            #   0.5  = moderate (peak ≈ 0.30)
+            #   1.0  = firm (peak ≈ 0.59 = 1 R_bar)
             "duration_bonus_scale": trial.suggest_categorical(
-                "duration_bonus_scale", [0, 0.5, 1.0, 2.0]
+                "duration_bonus_scale", [0, 0.05, 0.1, 0.25, 0.5, 1.0]
             ),
         },
         n_test=10,
@@ -176,9 +194,9 @@ if __name__ == "__main__":
 
     pruner = optuna.pruners.PercentilePruner(
         percentile=33.0,         # prune bottom 1/3 of trials
-        n_startup_trials=5,      # let first 5 trials run fully (need baseline data)
-        n_warmup_steps=int(iters * 0.20),  # 20% of training budget
-        n_min_trials=3,          # need ≥3 completed trials at a step to compare
+        n_startup_trials=15,      # let first 15 trials run fully (need baseline data)
+        n_warmup_steps=int(iters * 0.50),  # 50% of training budget
+        n_min_trials=10,          # need ≥10 completed trials at a step to compare
     )
     study = optuna.load_study(study_name=study_name, storage=path, pruner=pruner)
     study.optimize(lambda t: objective(t, iters=iters), n_trials=num_trials, gc_after_trial=True)
