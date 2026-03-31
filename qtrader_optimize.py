@@ -81,9 +81,10 @@ def objective(trial, iters=150):
             # ================================================================
             # LOCKED — Exploration schedule
             # ================================================================
-            "expl_decay": 0.995,
-            "expl_min": 0.03,
-            "n_steps_checkpoint": 500,
+            "expl_max": 3.0, # for BoltzmannDQTPAgent, 1.0 for DQTPAgent
+            "expl_decay": 0.993,
+            "expl_min": 0.05, # for BoltzmannDQTPAgent, 0.03 for DQTPAgent
+            "n_steps_checkpoint": 750,
 
             # ================================================================
             # TUNED — Experience replay
@@ -151,6 +152,16 @@ def objective(trial, iters=150):
             #   1.0  = firm (peak ≈ 0.59 = 1 R_bar)
             "duration_bonus_scale": trial.suggest_categorical(
                 "duration_bonus_scale", [0, 0.05, 0.1, 0.25, 0.5, 1.0]
+            ),
+            # opp_cost_scale: per-bar flat penalty = scale × max(0, market_return).
+            #   Penalizes missed upside only (no penalty when market falls).
+            #   0    = disabled (R_FLAT = 0)
+            #   0.05 = subtle (mean penalty ~0.018/bar)
+            #   0.1  = gentle (mean ~0.035/bar, E[Q(FLAT)] ~ -2.5)
+            #   0.25 = moderate (mean ~0.088/bar, E[Q(FLAT)] ~ -6.3)
+            #   0.5  = strong (mean ~0.175/bar, E[Q(FLAT)] ~ -12.5)
+            "opp_cost_scale": trial.suggest_categorical(
+                "opp_cost_scale", [0, 0.05, 0.1, 0.25, 0.5]
             ),
         },
         n_test=10,

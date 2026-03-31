@@ -49,6 +49,7 @@ class DQTPAgent(BaseAgent):
         exit_loss_ratio=1.0,
         action_cooldown_bars=0,
         duration_bonus_scale=0.0,
+        opp_cost_scale=0.0,
         bar_period_seconds=3600,
         no_learn=False,
         no_full_state=True,
@@ -88,6 +89,7 @@ class DQTPAgent(BaseAgent):
         self.exit_loss_ratio = exit_loss_ratio
         self.action_cooldown_bars = action_cooldown_bars
         self.duration_bonus_scale = duration_bonus_scale
+        self.opp_cost_scale = opp_cost_scale
         self.bar_period_seconds = bar_period_seconds
 
         self.model_name = "QAgent-Model-{}.keras"
@@ -528,8 +530,13 @@ class DQTPAgent(BaseAgent):
                         1.0 - ((hold_days - peak) / w) ** 2
                     )
 
+        # Opportunity cost: penalize flat by missed upside
+        opp_cost = 0.0
+        if self.opp_cost_scale > 0 and p_t < 0.5:
+            opp_cost = self.opp_cost_scale * max(0.0, market_return)
+
         R_long = market_return - hold_cost
-        return p_t * R_long - trade_cost + exit_bonus + duration_bonus
+        return p_t * R_long - trade_cost + exit_bonus + duration_bonus - opp_cost
 
     def _generate_examples_from_state(self, sf) -> Optional[tuple]:
         state = self.pprovider.load_dict(name=sf) if not isinstance(sf, dict) else sf

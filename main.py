@@ -31,8 +31,8 @@ from qtrader.environments.base import BaseMarketEnv
 from qtrader.environments.lean import LeanMarketEnv
 from qtrader.agents.base import RandomAgent
 
-# from qtrader.agents.dq import DQAgent
 from qtrader.agents.dqtp import DQTPAgent
+from qtrader.agents.bdqtp import BoltzmannDQTPAgent
 
 from qtrader.rlflow.state import StateProviderTask, StateAggregatorTask
 from qtrader.rlflow.action import ActTask
@@ -74,11 +74,11 @@ class QTraderAlgorithm(QCAlgorithm):
         model_fl_size = int(params.get("model_fl_size", 128))
         model_shape = params.get("model_shape", "flat")
 
-        agent = DQTPAgent(
+        agent = BoltzmannDQTPAgent( # DQTPAgent(
             name=name,
             pprovider=pprovider,
-            expl_max=1,
-            expl_min=float(params.get("expl_min", 0.01)),
+            expl_max=3.0, # for BoltzmannDQTPAgent, 1.0 for DQTPAgent
+            expl_min=float(params.get("expl_min", 0.5)),
             expl_decay=float(params.get("expl_decay", 0.9995)),
             invest_pct=float(params.get("invest_pct", 0.05)),
             n_steps_warmup=int(params.get("n_steps_warmup", 1024)),
@@ -105,6 +105,7 @@ class QTraderAlgorithm(QCAlgorithm):
             exit_bonus_scale=float(params.get("exit_bonus_scale", 5.0)),
             exit_loss_ratio=float(params.get("exit_loss_ratio", 0.7)),
             duration_bonus_scale=float(params.get("duration_bonus_scale", 0.0)),
+            opp_cost_scale=float(params.get("opp_cost_scale", 0.0)),
             action_cooldown_bars=int(params.get("action_cooldown_bars", 0)),
             bar_period_seconds=int(self.BAR_PERIOD.total_seconds()),
         )
