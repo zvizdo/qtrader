@@ -74,11 +74,23 @@ class QTraderAlgorithm(QCAlgorithm):
         model_fl_size = int(params.get("model_fl_size", 128))
         model_shape = params.get("model_shape", "flat")
 
-        agent = BoltzmannDQTPAgent( # DQTPAgent(
+        agent_class = params.get("agent_class", "boltzmann")
+        # Boltzmann uses τ ∈ [expl_min, expl_max]; ε-greedy uses
+        # exploration-rate ∈ [expl_min, expl_max] with very different scales.
+        if agent_class == "epsilon_greedy":
+            AgentCls = DQTPAgent
+            default_expl_max = 1.0
+            default_expl_min = 0.03
+        else:
+            AgentCls = BoltzmannDQTPAgent
+            default_expl_max = 3.0
+            default_expl_min = 0.3
+
+        common_kwargs = dict(
             name=name,
             pprovider=pprovider,
-            expl_max=3.0, # for BoltzmannDQTPAgent, 1.0 for DQTPAgent
-            expl_min=float(params.get("expl_min", 0.5)),
+            expl_max=float(params.get("expl_max", default_expl_max)),
+            expl_min=float(params.get("expl_min", default_expl_min)),
             expl_decay=float(params.get("expl_decay", 0.9995)),
             invest_pct=float(params.get("invest_pct", 0.05)),
             n_steps_warmup=int(params.get("n_steps_warmup", 1024)),
@@ -109,7 +121,12 @@ class QTraderAlgorithm(QCAlgorithm):
             action_cooldown_bars=int(params.get("action_cooldown_bars", 0)),
             bar_period_seconds=int(self.BAR_PERIOD.total_seconds()),
         )
+        if AgentCls is BoltzmannDQTPAgent:
+            common_kwargs["boltz_uniform_floor"] = float(
+                params.get("boltz_uniform_floor", 0.05)
+            )
 
+        agent = AgentCls(**common_kwargs)
         return agent
 
     def initialize(self):
@@ -459,6 +476,11 @@ class QTraderAlgorithm(QCAlgorithm):
 
         self.pprovider.close()
 
+        # Clear keras session to avoid pythonnet hangs on exit
+        import gc
+        tf.keras.backend.clear_session()
+        gc.collect()
+
         if self.p_run_type == "WARMUP":
             return
 
@@ -506,6 +528,42 @@ class QTraderAlgorithm(QCAlgorithm):
         self.set_summary_statistic("exploration_rate", agent.expl_rate)
         # self.set_summary_statistic("n_updates", agent.n_updates)
         # self.set_summary_statistic("replay_buffer_size", agent.rb.size)
+
+        # -- Action distribution (per env-step fractions) --
+        if hasattr(agent, "action_total") and agent.action_total > 0:
+            self.set_summary_statistic(
+                "action_frac_flat", agent.action_flat_count / agent.action_total
+            )
+            self.set_summary_statistic(
+                "action_frac_long", agent.action_long_count / agent.action_total
+            )
+
+        # -- Per-action Q split (FLAT vs LONG means) --
+        if hasattr(agent, "q_action_tracker_n") and agent.q_action_tracker_n > 0:
+            self.set_summary_statistic(
+                "mean_q_flat", agent.q_flat_tracker / agent.q_action_tracker_n
+            )
+            self.set_summary_statistic(
+                "mean_q_long", agent.q_long_tracker / agent.q_action_tracker_n
+            )
+
+        # -- Reward component breakdown (per replay-sample means) --
+        if hasattr(agent, "reward_component_n") and agent.reward_component_n > 0:
+            n = agent.reward_component_n
+            self.set_summary_statistic("mean_commission", agent.comm_tracker / n)
+            self.set_summary_statistic("mean_hold_cost", agent.hold_cost_tracker / n)
+            self.set_summary_statistic("mean_exit_bonus", agent.exit_bonus_tracker / n)
+            self.set_summary_statistic(
+                "mean_duration_bonus", agent.duration_bonus_tracker / n
+            )
+            self.set_summary_statistic("mean_opp_cost", agent.opp_cost_tracker / n)
+
+        # -- Boltzmann exploration diagnostic --
+        if hasattr(agent, "boltz_sample_count") and agent.boltz_sample_count > 0:
+            self.set_summary_statistic(
+                "boltzmann_argmax_rate",
+                agent.boltz_argmax_count / agent.boltz_sample_count,
+            )
 
         self.log(
             "{} - TotalPortfolioValue: {}".format(

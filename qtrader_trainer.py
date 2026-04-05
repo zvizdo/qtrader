@@ -206,34 +206,104 @@ def trainer_run(name, iters, params, n_test=5, prune=None):
         eval_name = f"Eval{str(step).zfill(6)}"
 
         if is_last_iter:
-            eval_start = eval_period_start
-            eval_end = eval_period_end
+            # Final eval: K=5 randomized 280-day windows, aggregate Sharpe to
+            # remove the single-window luck artifact. Seeded deterministically
+            # across trials via 42 + step + 1000*k.
+            K_FINAL_EVAL_WINDOWS = 5
+            final_eval_stats = []
+            max_offset_days = (eval_period_end - eval_period_start).days - eval_sample_duration_days
+            for k in range(K_FINAL_EVAL_WINDOWS):
+                np.random.seed(42 + step + 1000 * k)
+                offset = int(np.random.randint(0, max_offset_days))
+                eval_start_k = eval_period_start + timedelta(days=offset)
+                eval_end_k = eval_start_k + timedelta(days=eval_sample_duration_days)
+
+                run_params.update(
+                    {
+                        "run_type": "EVAL",
+                        "date_start": eval_start_k,
+                        "date_end": eval_end_k,
+                        "seed": 42 + step + 1000 * k,
+                    }
+                )
+                run_params["hyperparams"] = dict(params)
+                if "eval_invest_pct" in run_params["hyperparams"]:
+                    run_params["hyperparams"]["invest_pct"] = run_params["hyperparams"]["eval_invest_pct"]
+
+                stats_k = run_backtest(
+                    proj_path, config_dir_f, iter_dir_f, name,
+                    f"{eval_name}_W{k}", run_params, False
+                )
+                final_eval_stats.append(stats_k)
+                # Log each window under a distinct TB step so all 5 are visible.
+                logger.log_eval_step(step=step * 100 + k, stats=stats_k)
+
+            # Aggregate metrics across the 5 randomized windows.
+            def _get(s, *keys, default=0.0):
+                cur = s
+                for key in keys:
+                    if not isinstance(cur, dict) or key not in cur:
+                        return default
+                    cur = cur[key]
+                try:
+                    return float(cur)
+                except (TypeError, ValueError):
+                    return default
+
+            sharpes = np.array([
+                _get(s, "totalPerformance", "portfolioStatistics", "sharpeRatio")
+                for s in final_eval_stats
+            ], dtype=float)
+            num_trades_arr = np.array([
+                _get(s, "totalPerformance", "tradeStatistics", "totalNumberOfTrades")
+                for s in final_eval_stats
+            ], dtype=float)
+            profits = np.array([
+                _get(s, "totalPerformance", "portfolioStatistics", "endEquity")
+                - _get(s, "totalPerformance", "portfolioStatistics", "startEquity")
+                for s in final_eval_stats
+            ], dtype=float)
+
+            aggregated = {
+                "sharpe_final_mean": float(np.mean(sharpes)),
+                "sharpe_final_median": float(np.median(sharpes)),
+                "sharpe_final_p25": float(np.percentile(sharpes, 25)),
+                "sharpe_final_p75": float(np.percentile(sharpes, 75)),
+                "num_trades_final_mean": float(np.mean(num_trades_arr)),
+                "profit_final_mean": float(np.mean(profits)),
+                "n_windows": int(len(final_eval_stats)),
+            }
+
+            # Return the last window's stats with aggregated attached for
+            # downstream Optuna objective consumption.
+            stats = final_eval_stats[-1]
+            stats["aggregated"] = aggregated
+            logger.log_final_eval_aggregate(step=step, aggregated=aggregated)
+            # Also push into eval_stats so `_report_evals` has access if needed.
+            eval_stats.append(stats)
         else:
+            # Periodic eval: fixed window. Balanced (BTC HODL ≈ 0% return),
+            # runs fast, reused as pruner signal.
             eval_start = datetime(2025, 1, 15)
             eval_end = datetime(2026, 1, 14)
-            # eval_start = eval_period_start + timedelta(
-            #     days=np.random.randint(0, (eval_period_end - eval_period_start).days - eval_sample_duration_days)
-            # )
-            # eval_end = eval_start + timedelta(days=eval_sample_duration_days)
 
-        run_params.update(
-            {
-                "run_type": "EVAL",
-                "date_start": eval_start,
-                "date_end": eval_end,
-                "seed": 42 + step,
-            }
-        )
-        
-        # Clamp to evaluation invest_pct
-        run_params["hyperparams"] = dict(params)
-        if "eval_invest_pct" in run_params["hyperparams"]:
-            run_params["hyperparams"]["invest_pct"] = run_params["hyperparams"]["eval_invest_pct"]
-        stats = run_backtest(
-            proj_path, config_dir_f, iter_dir_f, name, eval_name, run_params, False
-        )
-        eval_stats.append(stats)
-        logger.log_eval_step(step=step, stats=stats)
+            run_params.update(
+                {
+                    "run_type": "EVAL",
+                    "date_start": eval_start,
+                    "date_end": eval_end,
+                    "seed": 42 + step,
+                }
+            )
+            run_params["hyperparams"] = dict(params)
+            if "eval_invest_pct" in run_params["hyperparams"]:
+                run_params["hyperparams"]["invest_pct"] = run_params["hyperparams"]["eval_invest_pct"]
+
+            stats = run_backtest(
+                proj_path, config_dir_f, iter_dir_f, name, eval_name, run_params, False
+            )
+            eval_stats.append(stats)
+            logger.log_eval_step(step=step, stats=stats)
         # endregion
 
         if not is_last_iter and prune is not None and callable(prune):

@@ -60,5 +60,10 @@ if __name__ == '__main__':
             trials.append((pid, t, pid_logs))
             trials_ran += 1
             print(f"RUNNER: New trial ran; Total: {trials_ran}")
+            # Stagger spawns so each worker can atomically claim a WAITING
+            # enqueued trial before the next worker calls study.ask().
+            # Without this, fast parallel launches race on the SQLite study
+            # and multiple workers pick up the same enqueued params.
+            time.sleep(3)
 
         time.sleep(5)

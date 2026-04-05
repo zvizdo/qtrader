@@ -13,6 +13,20 @@ from qtrader.agents.dqtp import DQTPAgent
 
 class BoltzmannDQTPAgent(DQTPAgent):
 
+    def __init__(self, *args, boltz_uniform_floor: float = 0.05, **kwargs):
+        """Boltzmann exploration agent.
+
+        Parameters
+        ----------
+        boltz_uniform_floor : float
+            Mixing weight for a uniform distribution over valid actions,
+            added to the softmax probabilities to guarantee a minimum
+            exploration rate even when τ decays. Set to 0 to disable.
+            Default 0.05 (5% of probability mass on uniform).
+        """
+        super().__init__(*args, **kwargs)
+        self.boltz_uniform_floor = float(boltz_uniform_floor)
+
     # ── semantic alias ──────────────────────────────────────────────
 
     @property
@@ -63,16 +77,36 @@ class BoltzmannDQTPAgent(DQTPAgent):
                     }
 
                 else:
-                    # Boltzmann: sample ∝ exp(Q / τ)
+                    # Boltzmann: sample ∝ exp(Q / τ), mixed with a uniform
+                    # floor over valid actions to guarantee exploration
+                    # survives τ decay. probs = (1-f)*softmax + f*uniform.
                     valid = pa > 0
                     logits = np.full_like(p, -np.inf)
                     logits[valid] = p[valid] / self.tau
                     logits[valid] -= logits[valid].max()   # log-sum-exp stability
-                    probs = np.zeros_like(p)
-                    probs[valid] = np.exp(logits[valid])
-                    probs /= probs.sum()
+                    softmax_probs = np.zeros_like(p)
+                    softmax_probs[valid] = np.exp(logits[valid])
+                    softmax_probs /= softmax_probs.sum()
+
+                    f = self.boltz_uniform_floor
+                    if f > 0.0:
+                        n_valid = int(valid.sum())
+                        uniform = np.zeros_like(p)
+                        uniform[valid] = 1.0 / n_valid
+                        probs = (1.0 - f) * softmax_probs + f * uniform
+                        probs /= probs.sum()
+                    else:
+                        probs = softmax_probs
 
                     ai = np.random.choice(len(self.ACTIONS), p=probs)
+
+                    # Argmax-rate diagnostic: how often the sampled action
+                    # equals the greedy argmax (1.0 = fully deterministic).
+                    masked = np.where(valid, p, -np.inf)
+                    argmax_ai = int(np.argmax(masked))
+                    self.boltz_argmax_count += int(ai == argmax_ai)
+                    self.boltz_sample_count += 1
+
                     actions[sy] = {
                         "action_private": self.ACTIONS[ai],
                         "method": "boltzmann",
@@ -83,5 +117,14 @@ class BoltzmannDQTPAgent(DQTPAgent):
 
         for sy in symbols:
             actions[sy] = self._shape_action(actions[sy], sy, state)
+
+        # -- Action-fraction tracking (mirrors parent DQTPAgent.act) --
+        for sy in symbols:
+            ap = actions[sy].get("action_private")
+            if ap == self.ACTION_FLAT:
+                self.action_flat_count += 1
+            elif ap == self.ACTION_LONG:
+                self.action_long_count += 1
+            self.action_total += 1
 
         return actions

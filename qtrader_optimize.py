@@ -73,18 +73,28 @@ def objective(trial, iters=150):
             # ================================================================
             # LOCKED — Update frequency & warmup
             # ================================================================
-            "n_step_update": trial.suggest_categorical(
-                "n_step_update", [32, 48, 64]
-            ),
+            "n_step_update": 64, # trial.suggest_categorical("n_step_update", [32, 48, 64]),
             "n_steps_warmup": 5_000,
 
             # ================================================================
-            # LOCKED — Exploration schedule
+            # TUNED — Exploration schedule
             # ================================================================
+            # agent_class: control arm vs Boltzmann. Routes in main.py._create_agent.
+            "agent_class": trial.suggest_categorical(
+                "agent_class", ["boltzmann", "epsilon_greedy"]
+            ),
             "expl_max": 3.0, # for BoltzmannDQTPAgent, 1.0 for DQTPAgent
-            "expl_decay": 0.993,
-            "expl_min": 0.05, # for BoltzmannDQTPAgent, 0.03 for DQTPAgent
-            "n_steps_checkpoint": 750,
+            # expl_min acts as τ floor for Boltzmann; ε floor for ε-greedy.
+            # Previous sweep used 0.1 → full determinism by mid-training.
+            # Raised floors prevent exploration collapse.
+            "expl_min": trial.suggest_categorical("expl_min", [0.2, 0.3, 0.5]),
+            "expl_decay": trial.suggest_categorical("expl_decay", [0.995, 0.998]),
+            "n_steps_checkpoint": 800,
+            # Boltzmann uniform-mix floor: guarantees permanent exploration
+            # regardless of τ decay. 0 = disabled, 0.05 ≈ 5% uniform mass.
+            "boltz_uniform_floor": trial.suggest_categorical(
+                "boltz_uniform_floor", [0.02, 0.05, 0.1]
+            ),
 
             # ================================================================
             # TUNED — Experience replay
@@ -106,62 +116,37 @@ def objective(trial, iters=150):
             # ================================================================
             "invest_pct": 0.25,
             "eval_invest_pct": 0.25,
+            # Locked to 2: Tr0030-0038 (cd=0) definitively overtraded and
+            # diverged; cd=2 was stable across all prior trials.
             "action_cooldown_bars": 2,
 
             # ================================================================
-            # TUNED — Reward shaping (all in R_bar units, 0 = disabled)
+            # LOCKED — Reward shaping (pinned from 39-trial reward-calib sweep)
             # ================================================================
-            # All peaks capped ≤ 1 R_bar to avoid destabilizing learning.
-            # Previous ranges (up to 8× R_bar) overwhelmed market signal.
-            #
-            # hold_cost_scale: per-bar penalty past 72h, grows as days^1.5.
-            #   Effective R_bar/bar at excess days: scale × [1d:1.0, 2d:2.83, 5d:11.18]
-            #   0     = no hold pressure
-            #   0.005 = whisper (5d excess → 0.06 R_bar/bar)
-            #   0.01  = gentle (5d excess → 0.11 R_bar/bar)
-            #   0.02  = moderate (5d excess → 0.22 R_bar/bar)
-            #   0.05  = firm (5d excess → 0.56 R_bar/bar)
-            "hold_cost_scale": trial.suggest_categorical(
-                "hold_cost_scale", [0, 0.005, 0.01, 0.02, 0.05]
-            ),
-            # exit_bonus_scale: peak tanh-compressed exit bonus in R_bar.
-            #   Scale value = peak bonus in R_bar units (tanh saturates at 1).
-            #   0    = no exit shaping (pure market return only)
-            #   0.1  = subtle (peak ≈ 0.06)
-            #   0.25 = gentle (peak ≈ 0.15)
-            #   0.5  = moderate (peak ≈ 0.30)
-            #   1.0  = firm (peak ≈ 0.59 = 1 R_bar)
-            #   2.0  = strong (peak ≈ 1.18 = 2 R_bar)
-            "exit_bonus_scale": trial.suggest_categorical(
-                "exit_bonus_scale", [0, 0.1, 0.25, 0.5, 1.0, 2.0]
-            ),
-            # exit_loss_ratio: loss penalty as fraction of profit bonus.
-            #   0.5 = strong asymmetry (encourage risk-taking)
-            #   0.7 = moderate asymmetry (current default)
-            #   1.0 = symmetric (equal penalty for losses and reward for profits)
-            "exit_loss_ratio": trial.suggest_categorical(
-                "exit_loss_ratio", [0.5, 0.7, 1.0]
-            ),
-            # duration_bonus_scale: one-time exit bonus for holding 1-5d (peak 3d).
-            #   Scale value = peak bonus in R_bar units.
-            #   0    = disabled
-            #   0.05 = whisper (peak ≈ 0.03)
-            #   0.1  = subtle (peak ≈ 0.06)
-            #   0.25 = gentle (peak ≈ 0.15)
-            #   0.5  = moderate (peak ≈ 0.30)
-            #   1.0  = firm (peak ≈ 0.59 = 1 R_bar)
-            "duration_bonus_scale": trial.suggest_categorical(
-                "duration_bonus_scale", [0, 0.05, 0.1, 0.25, 0.5, 1.0]
-            ),
+            # hold_cost_scale: ≥0.02 strictly worse across all prior trials
+            # (Tr0012,0014,0016 death-spiraled faster). 0.005 is the safe default.
+            "hold_cost_scale": 0.005,
+            # exit_bonus_scale: locked at 1.0 (1 R_bar peak) — after lowering
+            # _TRADE_PNL_REF to 0.01 this restores tanh resolution in the
+            # 0.5-3% pnl range where most 1H BTC trades live.
+            "exit_bonus_scale": 1.0,
+            # exit_loss_ratio: mildly asymmetric (loss penalty = 70% of profit bonus).
+            "exit_loss_ratio": 0.7,
+            # duration_bonus_scale: showed no measurable effect in any prior trial.
+            "duration_bonus_scale": 0.0,
+
+            # ================================================================
+            # TUNED — Anti-flat lever (only reward knob still swept)
+            # ================================================================
             # opp_cost_scale: per-bar flat penalty = scale × max(0, market_return).
-            #   Penalizes missed upside only (no penalty when market falls).
-            #   0    = disabled (R_FLAT = 0)
-            #   0.05 = subtle (mean penalty ~0.018/bar)
-            #   0.1  = gentle (mean ~0.035/bar, E[Q(FLAT)] ~ -2.5)
-            #   0.25 = moderate (mean ~0.088/bar, E[Q(FLAT)] ~ -6.3)
-            #   0.5  = strong (mean ~0.175/bar, E[Q(FLAT)] ~ -12.5)
+            # Previous sweep capped at 0.5, which was insufficient to counter
+            # the death-spiral asymmetry. Extended upper range to 2.0.
+            #   0.25 = prior sweep upper mid (baseline)
+            #   0.5  = prior sweep max
+            #   1.0  = E[Q(FLAT)] ≈ -0.035/bar, meaningful anti-flat pressure
+            #   2.0  = E[Q(FLAT)] ≈ -0.07/bar, strong anti-flat
             "opp_cost_scale": trial.suggest_categorical(
-                "opp_cost_scale", [0, 0.05, 0.1, 0.25, 0.5]
+                "opp_cost_scale", [0.25, 0.5, 1.0, 2.0]
             ),
         },
         n_test=10,
@@ -170,11 +155,15 @@ def objective(trial, iters=150):
 
     try:
         total_perf = stats["totalPerformance"]
-        port_stats = total_perf["portfolioStatistics"]
-        trade_stats = total_perf.get("tradeStatistics", {})
-        pnl = float(port_stats["endEquity"]) - float(port_stats["startEquity"])
-        sh_ratio = float(port_stats["sharpeRatio"])
-        num_trades = int(trade_stats.get("totalNumberOfTrades", 0))
+        aggregated = stats.get("aggregated")
+        if not aggregated:
+            raise optuna.TrialPruned(
+                "Stats missing 'aggregated' key — trainer must populate "
+                "randomized multi-window final eval metrics."
+            )
+        sh_ratio = float(aggregated["sharpe_final_mean"])
+        num_trades = int(aggregated["num_trades_final_mean"])
+        pnl = float(aggregated["profit_final_mean"])
     except (KeyError, TypeError, ValueError) as e:
         raise optuna.TrialPruned(f"Stats malformed or missing expected keys: {e}")
 
@@ -183,6 +172,9 @@ def objective(trial, iters=150):
     trial.set_user_attr("pnl", pnl)
     trial.set_user_attr("sharpe", sh_ratio)
     trial.set_user_attr("num_trades", num_trades)
+    trial.set_user_attr("sharpe_median", float(aggregated.get("sharpe_final_median", sh_ratio)))
+    trial.set_user_attr("sharpe_p25", float(aggregated.get("sharpe_final_p25", sh_ratio)))
+    trial.set_user_attr("sharpe_p75", float(aggregated.get("sharpe_final_p75", sh_ratio)))
     trial.set_user_attr("stats", json.dumps(total_perf))
     return score
 

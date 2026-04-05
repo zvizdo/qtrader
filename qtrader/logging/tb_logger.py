@@ -99,6 +99,34 @@ class TrainingLogger:
                 _safe_float(perf, "tradeStatistics", "totalNumberOfTrades"),
             )
 
+            # -- Action distribution --
+            for key in ("action_frac_flat", "action_frac_long"):
+                if key in s:
+                    tf.summary.scalar(f"train/{key}", float(s[key]))
+
+            # -- Per-action Q split --
+            for key in ("mean_q_flat", "mean_q_long"):
+                if key in s:
+                    tf.summary.scalar(f"train/{key}", float(s[key]))
+
+            # -- Reward component breakdown --
+            for key in (
+                "mean_commission",
+                "mean_hold_cost",
+                "mean_exit_bonus",
+                "mean_duration_bonus",
+                "mean_opp_cost",
+            ):
+                if key in s:
+                    tf.summary.scalar(f"train/{key}", float(s[key]))
+
+            # -- Boltzmann exploration diagnostic --
+            if "boltzmann_argmax_rate" in s:
+                tf.summary.scalar(
+                    "train/boltzmann_argmax_rate",
+                    float(s["boltzmann_argmax_rate"]),
+                )
+
         self._writer.flush()
 
     # ------------------------------------------------------------------
@@ -132,6 +160,27 @@ class TrainingLogger:
                 _safe_float(perf, "tradeStatistics", "winRate"),
             )
 
+        self._writer.flush()
+
+    # ------------------------------------------------------------------
+    # Final-eval aggregate (logged once at the very end of a run)
+    # ------------------------------------------------------------------
+    def log_final_eval_aggregate(self, step: int, aggregated: dict) -> None:
+        """Log aggregated Sharpe/profit/trade metrics across the K randomized
+        final-eval windows. Called from ``qtrader_trainer`` after the final
+        iteration's multi-window eval loop.
+        """
+        with self._writer.as_default(step=step):
+            for key in (
+                "sharpe_final_mean",
+                "sharpe_final_median",
+                "sharpe_final_p25",
+                "sharpe_final_p75",
+                "num_trades_final_mean",
+                "profit_final_mean",
+            ):
+                if key in aggregated:
+                    tf.summary.scalar(f"eval_final/{key}", float(aggregated[key]))
         self._writer.flush()
 
     # ------------------------------------------------------------------

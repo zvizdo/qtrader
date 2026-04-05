@@ -121,6 +121,28 @@ class DQTPAgent(BaseAgent):
         self.q_value_tracker, self.q_value_diff_tracker, self.q_value_tracker_n = 0.0, 0, 0
         self.reward_tracker, self.reward_tracker_n = 0.0, 0
 
+        # -- Action distribution (per env-step, accumulated in act()) --
+        self.action_flat_count = 0
+        self.action_long_count = 0
+        self.action_total = 0
+
+        # -- Per-action Q-values (per learn() batch) --
+        self.q_flat_tracker = 0.0
+        self.q_long_tracker = 0.0
+        self.q_action_tracker_n = 0
+
+        # -- Reward components (per replay-sample via _reward_active) --
+        self.comm_tracker = 0.0
+        self.hold_cost_tracker = 0.0
+        self.exit_bonus_tracker = 0.0
+        self.duration_bonus_tracker = 0.0
+        self.opp_cost_tracker = 0.0
+        self.reward_component_n = 0
+
+        # -- Boltzmann exploration diagnostics (only populated by bdqtp) --
+        self.boltz_argmax_count = 0
+        self.boltz_sample_count = 0
+
     def load_config(self):
         try:
             c = self.pprovider.load_dict("QAgent-Params")
@@ -240,6 +262,15 @@ class DQTPAgent(BaseAgent):
         # shape actions
         for sy in symbols:
             actions[sy] = self._shape_action(actions[sy], sy, state)
+
+        # -- Action-fraction tracking (post-shaping, private action space) --
+        for sy in symbols:
+            ap = actions[sy].get("action_private")
+            if ap == self.ACTION_FLAT:
+                self.action_flat_count += 1
+            elif ap == self.ACTION_LONG:
+                self.action_long_count += 1
+            self.action_total += 1
 
         return actions
 
@@ -476,7 +507,7 @@ class DQTPAgent(BaseAgent):
     _R_BAR = 0.59  # sigma_1h × REWARD_SCALE — the per-bar noise floor
     _HOLD_THRESHOLD_HOURS = 72.0  # 3 days free hold, then cost ramps
     _HOLD_COST_POWER = 1.5  # power-law ramp after threshold
-    _TRADE_PNL_REF = 0.03  # median |trade_pnl_pct| for tanh normalization
+    _TRADE_PNL_REF = 0.01  # median |trade_pnl_pct| for tanh normalization (1H BTC scale)
     _DURATION_PEAK_DAYS = 3.0  # reverse-U peak for duration bonus
     _DURATION_HALF_WIDTH = 2.0  # half-width: bonus spans peak ± this (1d to 5d)
 
@@ -536,6 +567,15 @@ class DQTPAgent(BaseAgent):
             opp_cost = self.opp_cost_scale * max(0.0, market_return)
 
         R_long = market_return - hold_cost
+
+        # -- Reward component tracking (per replay-sample means via learn()) --
+        self.comm_tracker += float(trade_cost)
+        self.hold_cost_tracker += float(p_t * hold_cost)
+        self.exit_bonus_tracker += float(exit_bonus)
+        self.duration_bonus_tracker += float(duration_bonus)
+        self.opp_cost_tracker += float(opp_cost)
+        self.reward_component_n += 1
+
         return p_t * R_long - trade_cost + exit_bonus + duration_bonus - opp_cost
 
     def _generate_examples_from_state(self, sf) -> Optional[tuple]:
@@ -611,6 +651,11 @@ class DQTPAgent(BaseAgent):
         self.q_value_tracker += q_values.mean()
         self.q_value_diff_tracker += np.ptp(q_values, axis=1).mean()
         self.q_value_tracker_n += 1
+
+        # Per-action Q split (FLAT=idx 0, LONG=idx 1).
+        self.q_flat_tracker += float(q_values[:, 0].mean())
+        self.q_long_tracker += float(q_values[:, 1].mean())
+        self.q_action_tracker_n += 1
         q_values_future[pa == 0] = -np.inf
         q_f_action_index = np.argmax(q_values_future, axis=1)
 
